@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>WebGazer Test</title>
+  <script src="https://webgazer.cs.brown.edu/webgazer.js"></script>
+
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #111;
+      color: white;
+      text-align: center;
+    }
+
+    #info {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+    }
+
+    /* Top-right camera preview area */
+    #camera-overlay {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      width: 220px;
+      height: 160px;
+      background: rgba(0,0,0,0.35);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 8px;
+      overflow: hidden;
+      z-index: 9999;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #camera-preview {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      background: #000;
+      display: block;
+    }
+
+    #camera-close {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      background: rgba(0,0,0,0.5);
+      color: #fff;
+      border: none;
+      border-radius: 50%;
+      width: 26px;
+      height: 26px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 14px;
+      line-height: 1;
+    }
+
+    #camera-close:focus {
+      outline: 2px solid #66f;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div id="info">Move your eyes — the red dot should follow where you look!</div>
+
+  <!-- Fixation tuning controls -->
+  <div id="fix-controls" style="position:fixed;left:10px;bottom:20px;color:#DDD;font-size:13px;padding:8px;background:rgba(0,0,0,0.25);border-radius:8px;z-index:9998">
+    <div style="margin-bottom:6px;font-weight:600">Fixation Tuning</div>
+    Dispersion (px): <input id="ctlDisp" type="range" min="8" max="140" step="2" value="40"> <span id="ctlDispVal">40</span><br>
+    Min duration (ms): <input id="ctlDur" type="range" min="50" max="800" step="10" value="300"> <span id="ctlDurVal">300</span><br>
+    Velocity thresh (px/ms): <input id="ctlVel" type="range" min="0" max="2" step="0.01" value="0.25"> <span id="ctlVelVal">0.25</span>
+  </div>
+
+  <div id="status" aria-live="polite"
+       style="position:fixed;left:10px;top:40px;font-size:14px;opacity:0.9">
+    Status: initializing...
+  </div>
+
+  <div id="fixation"
+       style="position:fixed;left:10px;top:64px;font-size:14px;opacity:0.95">
+    Fixation: no
+  </div>
+
+  <div id="mouse-warning"
+       style="position:fixed;left:10px;top:88px;font-size:13px;color:#FFD36E;display:none">
+    Warning: tracking looks like mouse movement — enable camera below
+  </div>
+
+  <button id="enable-camera-btn" style="position:fixed;left:10px;top:110px">
+    Enable Camera
+  </button>
+
+  <button id="record-btn" style="position:fixed;left:140px;top:110px">
+    Start Recording
+  </button>
+
+  <label style="position:fixed;left:260px;top:110px;color:#DDD;font-size:13px">
+    <input id="flip-x" type="checkbox"> Mirror X
+  </label>
+
+  <label style="position:fixed;left:350px;top:110px;color:#DDD;font-size:13px">
+    <input id="flip-y" type="checkbox"> Mirror Y
+  </label>
+
+  <a id="download-records"
+     style="position:fixed;left:10px;top:140px;display:none"></a>
+
+  <div id="record-summary"
+       style="position:fixed;left:10px;top:164px;font-size:13px;color:#9EE;display:none">
+  </div>
+
+  <!-- Camera preview box -->
+  <div id="camera-overlay" aria-hidden="false">
+    <video id="camera-preview" autoplay muted playsinline></video>
+    <button id="camera-close" title="Hide camera">✕</button>
+  </div>
+
+  <script>
+    window.onload = async () => {
+
+      // Initialize WebGazer
+      await webgazer.setRegression('ridge').begin();
+
+      webgazer
+        .showVideoPreview(false)
+        .showPredictionPoints(true)
+        .showFaceOverlay(true);
+
+      const statusEl = document.getElementById('status');
+      const fixationEl = document.getElementById('fixation');
+
+      // Fixation parameters (made mutable so UI can tune them)
+      let fixationWindowMs = 600;
+      let fixationDispersionPx = 40;
+      let fixationMinDuration = 300;
+      // velocity threshold (px per ms). If median speed <= this and duration met, declare fixation.
+      let fixationVelThreshold = 0.25;
+
+      const gazeBuffer = [];
+      let inFixation = false;
+      let fixationStart = null;
+      // small hysteresis timer for leaving fixation
+      let leaveTimer = null;
+
+      // Recording
+      const recordBtn = document.getElementById('record-btn');
+      const downloadLink = document.getElementById('download-records');
+      const recordSummary = document.getElementById('record-summary');
+
+      let recording = false;
+      let recordedFixation = false;
+      let recordedFixationStart = null;
+      let recordedFixationWallStart = null;
+
+      const fixationRecords = [];
+      let lastFixationEnd = null;
+
+      recordBtn.addEventListener('click', () => {
+        recording = !recording;
+        recordBtn.textContent = recording ? 'Stop Recording' : 'Start Recording';
+
+        if (!recording) finalizeRecording();
+        else {
+          fixationRecords.length = 0;
+          lastFixationEnd = null;
+          downloadLink.style.display = 'none';
+          recordSummary.style.display = 'none';
+        }
+      });
+
+      function finalizeRecording() {
+        if (recordedFixation) {
+          const end = performance.now();
+          const start = recordedFixationStart || end;
+          const duration = end - start;
+          const gap = lastFixationEnd ? (start - lastFixationEnd) : null;
+
+          fixationRecords.push({ start, end, duration, gap });
+          lastFixationEnd = end;
+
+          recordedFixation = false;
+          recordedFixationStart = null;
+        }
+
+        if (!fixationRecords.length) {
+          recordSummary.style.display = 'block';
+          recordSummary.textContent = 'No fixations recorded.';
+          return;
+        }
+
+        const header =
+          'start_time_rel_ms,start_time_epoch_ms,start_time_ISO,' +
+          'end_time_rel_ms,end_time_epoch_ms,end_time_ISO,' +
+          'duration_ms,gap_since_last_fixation_ms\n';
+
+        const rows = fixationRecords.map(r => {
+          const sPerf = Math.round(r.startPerf);
+          const sWall = Math.round(r.startWall);
+          const sIso = new Date(sWall).toISOString();
+
+          const ePerf = Math.round(r.endPerf);
+          const eWall = Math.round(r.endWall);
+          const eIso = new Date(eWall).toISOString();
+
+          const dur = Math.round(r.duration);
+          const gap = r.gap == null ? '' : Math.round(r.gap);
+
+          return `${sPerf},${sWall},${sIso},${ePerf},${eWall},${eIso},${dur},${gap}`;
+        }).join("\n");
+
+        const blob = new Blob([header + rows], { type: "text/csv" });
+        const url = URL.createObjectURL(blob);
+
+        downloadLink.href = url;
+        downloadLink.download = 'fixation_records.csv';
+        downloadLink.textContent = 'Download fixation_records.csv';
+        downloadLink.style.display = 'inline-block';
+
+        const totalFix = fixationRecords.length;
+        const totalDuration = fixationRecords.reduce((s, r) => s + r.duration, 0);
+        const avgDuration = totalDuration / totalFix;
+
+        const gaps = fixationRecords.map(r => r.gap).filter(g => g != null);
+        const avgGap = gaps.length
+          ? gaps.reduce((s, g) => s + g, 0) / gaps.length
+          : 0;
+
+        recordSummary.style.display = 'block';
+        recordSummary.innerHTML =
+          `Recorded ${totalFix} fixations — total ${Math.round(totalDuration)}ms — `
+          + `avg ${Math.round(avgDuration)}ms — avg gap ${Math.round(avgGap)}ms`;
+      }
+
+      // Mirror handling
+      let flipX = false, flipY = false;
+      const previewEl = document.getElementById('camera-preview');
+
+      document.getElementById('flip-x').addEventListener('change', (ev) => {
+        flipX = ev.target.checked;
+        updatePreviewTransform();
+      });
+
+      document.getElementById('flip-y').addEventListener('change', (ev) => {
+        flipY = ev.target.checked;
+        updatePreviewTransform();
+      });
+
+      function updatePreviewTransform() {
+        const sx = flipX ? -1 : 1;
+        const sy = flipY ? -1 : 1;
+
+        previewEl.style.transform = `scale(${sx}, ${sy})`;
+
+        try {
+          const v = webgazer.getVideoElement();
+          if (v) v.style.transform = `scale(${sx}, ${sy})`;
+        } catch {}
+      }
+
+      // Mouse tracking check
+      let mousePos = { x: null, y: null };
+      window.addEventListener('mousemove', e => {
+        mousePos.x = e.clientX;
+        mousePos.y = e.clientY;
+      });
+
+      let similarToMouse = 0;
+      let gazeSamples = 0;
+
+      // helper: median
+      function median(arr){
+        if(!arr || !arr.length) return 0;
+        const s = arr.slice().sort((a,b)=>a-b);
+        const m = Math.floor(s.length/2);
+        return s.length%2 ? s[m] : (s[m-1]+s[m])/2;
+      }
+
+      // compute median instantaneous speed (px per ms) from buffer
+      function computeMedianSpeed(buf){
+        const speeds = [];
+        for(let i=1;i<buf.length;i++){
+          const dx = buf[i].x - buf[i-1].x;
+          const dy = buf[i].y - buf[i-1].y;
+          const dt = buf[i].t - buf[i-1].t;
+          if(dt <= 0) continue;
+          const dist = Math.hypot(dx,dy);
+          speeds.push(dist / dt);
+        }
+        return median(speeds);
+      }
+
+      // Main gaze logic
+      webgazer.setGazeListener((data, elapsedTime) => {
+        const now = performance.now();
+
+        if (!data) {
+          statusEl.textContent = 'Status: no gaze data yet';
+          gazeBuffer.length = 0;
+          inFixation = false;
+          fixationEl.textContent = 'Fixation: no';
+          return;
+        }
+
+        let x = data.x;
+        let y = data.y;
+
+        if (flipX) x = window.innerWidth - x;
+        if (flipY) y = window.innerHeight - y;
+
+        gazeBuffer.push({ x, y, t: now });
+
+        while (gazeBuffer.length && now - gazeBuffer[0].t > fixationWindowMs) {
+          gazeBuffer.shift();
+        }
+
+        let minX = Infinity, maxX = -Infinity;
+        let minY = Infinity, maxY = -Infinity;
+
+        gazeBuffer.forEach(p => {
+          if (p.x < minX) minX = p.x;
+          if (p.x > maxX) maxX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.y > maxY) maxY = p.y;
+        });
+
+        const disp = Math.max(maxX - minX, maxY - minY);
+        const medianSpeed = computeMedianSpeed(gazeBuffer);
+
+        gazeSamples++;
+        if (mousePos.x !== null &&
+            Math.hypot(mousePos.x - x, mousePos.y - y) < 12) {
+          similarToMouse++;
+        }
+
+        if (gazeSamples >= 15 &&
+            (similarToMouse / gazeSamples) > 0.7) {
+          document.getElementById('mouse-warning').style.display = 'block';
+        } else {
+          document.getElementById('mouse-warning').style.display = 'none';
+        }
+
+        // Combined fixation detection: either low dispersion OR low median speed
+        const isDispOk = disp <= fixationDispersionPx;
+        const isVelOk = medianSpeed <= fixationVelThreshold;
+
+        // Decide candidate fixation state
+        if (!inFixation) {
+          if (isDispOk || isVelOk) {
+            // start candidate
+            fixationStart = gazeBuffer[0].t;
+            inFixation = true;
+          }
+        }
+
+        if (inFixation) {
+          const duration = now - (fixationStart || now);
+
+          if (duration >= fixationMinDuration && (isDispOk || isVelOk)) {
+            // confirmed fixation
+            fixationEl.textContent = `Fixation: YES (${Math.round(duration)}ms, disp ${Math.round(disp)}px, vel ${medianSpeed.toFixed(3)})`;
+            fixationEl.style.color = '#7CFF7C';
+
+            if (recording && !recordedFixation) {
+              recordedFixation = true;
+              recordedFixationStart = fixationStart || now - duration;
+              recordedFixationWallStart = Date.now();
+            }
+            // clear any leave timer
+            if (leaveTimer){ clearTimeout(leaveTimer); leaveTimer = null; }
+
+          } else if (!(isDispOk || isVelOk)) {
+            // candidate no longer meets criteria -> start leave timer so minor blips don't end fixation immediately
+            if (!leaveTimer) {
+              leaveTimer = setTimeout(()=>{
+                // end fixation
+                if (recording && recordedFixation) {
+                  const end = performance.now();
+                  const endWall = Date.now();
+                  const startPerf = recordedFixationStart || end;
+                  const startWall = recordedFixationWallStart || endWall;
+                  const dur = end - startPerf;
+                  const gap = lastFixationEnd ? (startPerf - lastFixationEnd) : null;
+                  fixationRecords.push({ startPerf, startWall, endPerf: end, endWall, duration: dur, gap });
+                  lastFixationEnd = end;
+                  recordedFixation = false; recordedFixationStart = null; recordedFixationWallStart = null;
+                }
+                inFixation = false; fixationStart = null; leaveTimer = null;
+                fixationEl.textContent = 'Fixation: no'; fixationEl.style.color = '#FF8E8E';
+              }, 80); // 80 ms grace period
+            }
+            fixationEl.textContent = `Fixation: maybe (${Math.round(duration)}ms, vel ${medianSpeed.toFixed(3)})`;
+            fixationEl.style.color = '#FFD36E';
+          } else {
+            // still candidate
+            const duration2 = now - fixationStart;
+            fixationEl.textContent = `Fixation: maybe (${Math.round(duration2)}ms, vel ${medianSpeed.toFixed(3)})`;
+            fixationEl.style.color = '#FFD36E';
+          }
+        }
+
+        statusEl.textContent =
+          `Status: gaze at (${Math.round(x)}, ${Math.round(y)}) — `
+          + `buf ${gazeBuffer.length} disp ${Math.round(disp)}`;
+          // show velocity in status if possible
+          try{ statusEl.textContent += ` vel ${medianSpeed?medianSpeed.toFixed(3):'-'}`; }catch(e){}
+      });
+
+      // Attach camera stream
+      async function attachStream() {
+        const preview = document.getElementById('camera-preview');
+
+        try {
+          const wgVideo = webgazer.getVideoElement();
+          if (wgVideo && wgVideo.srcObject) {
+            preview.srcObject = wgVideo.srcObject;
+            return;
+          }
+        } catch {}
+
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+          preview.srcObject = stream;
+        } catch (err) {
+          console.warn("Camera fallback failed:", err);
+        }
+      }
+
+      attachStream();
+
+      // Camera hide button
+      document.getElementById('camera-close').addEventListener('click', () => {
+        document.getElementById('camera-overlay').style.display = 'none';
+      });
+
+      // Manual camera enable
+      document.getElementById('enable-camera-btn').addEventListener('click', async () => {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+          document.getElementById('camera-preview').srcObject = stream;
+
+          try {
+            const v = webgazer.getVideoElement();
+            if (v) v.srcObject = stream;
+          } catch {}
+        } catch (err) {
+          console.warn("User denied camera access:", err);
+        }
+      });
+
+      // Wire up tuning UI
+      try{
+        const ctlDisp = document.getElementById('ctlDisp');
+        const ctlDur = document.getElementById('ctlDur');
+        const ctlVel = document.getElementById('ctlVel');
+        const ctlDispVal = document.getElementById('ctlDispVal');
+        const ctlDurVal = document.getElementById('ctlDurVal');
+        const ctlVelVal = document.getElementById('ctlVelVal');
+
+        if(ctlDisp){ ctlDisp.addEventListener('input', (e)=>{ fixationDispersionPx = parseInt(e.target.value,10); ctlDispVal.textContent = fixationDispersionPx; }); }
+        if(ctlDur){ ctlDur.addEventListener('input', (e)=>{ fixationMinDuration = parseInt(e.target.value,10); ctlDurVal.textContent = fixationMinDuration; }); }
+        if(ctlVel){ ctlVel.addEventListener('input', (e)=>{ fixationVelThreshold = parseFloat(e.target.value); ctlVelVal.textContent = fixationVelThreshold.toFixed(2); }); }
+      }catch(e){console.warn('Could not wire tuning UI',e)}
+    };
+  </script>
+
+</body>
+</html>

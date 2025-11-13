@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>WebGazer Fixation Tracker (Fixed)</title>
+  <script src="https://webgazer.cs.brown.edu/webgazer.js"></script>
+  <style>
+    body {
+      margin: 0;
+      height: 100vh;
+      background: radial-gradient(circle at top, #0f172a, #020617);
+      color: #e2e8f0;
+      font-family: 'Inter', sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: flex-start;
+      overflow: hidden;
+      padding-top: 2rem;
+    }
+    button {
+      background: #3b82f6;
+      color: white;
+      border: none;
+      padding: 0.6rem 1.2rem;
+      border-radius: 8px;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: background 0.2s ease;
+    }
+    button:hover { background: #2563eb; }
+    #gaze-dot {
+      position: fixed;
+      width: 25px;
+      height: 25px;
+      background: rgba(255, 71, 107, 0.9);
+      border-radius: 50%;
+      box-shadow: 0 0 20px rgba(255, 71, 107, 0.7);
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      transition: transform 0.08s linear;
+      display: none;
+      z-index: 10;
+    }
+    #calibration {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.85);
+      z-index: 9999;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-evenly;
+      align-items: center;
+      padding: 2rem;
+      pointer-events: all;
+    }
+    .calib-dot {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: #f87171;
+      cursor: pointer;
+      box-shadow: 0 0 20px rgba(248,113,113,0.6);
+      transition: transform 0.2s ease, background 0.3s;
+    }
+    .calib-dot.active {
+      background: #22c55e;
+      transform: scale(1.3);
+    }
+    .roi-btn {
+      background: #1e293b;
+      border: 2px solid #3b82f6;
+      color: #e2e8f0;
+      padding: 1rem 2rem;
+      border-radius: 10px;
+      cursor: pointer;
+      font-size: 1.1rem;
+      transition: all 0.2s;
+      margin: 0.5rem;
+    }
+    .roi-btn:hover { background: #3b82f6; color: white; }
+  </style>
+</head>
+<body>
+  <h1>WebGazer Fixation Tracker (Fixed)</h1>
+  <div>
+    <button id="enable-camera-btn">Enable Camera</button>
+    <button id="clear-overlays-btn" style="margin-left:0.6rem;background:#ef4444">Clear Overlays</button>
+    <button id="restore-overlays-btn" style="margin-left:0.6rem;background:#10b981;display:inline-block">Restore Overlays</button>
+    <button id="start-calibration-btn" style="display:none;">Start Calibration</button>
+    <button id="download-btn" style="display:none;">Download Data</button>
+  </div>
+  <div id="video-container" style="position:relative; z-index:1;">
+    <video id="webgazerVideoFeed" autoplay muted playsinline
+      style="width:350px;height:260px;border-radius:10px;object-fit:cover;transform:scaleX(-1);pointer-events:none;"></video>
+  </div>
+  <div id="gaze-dot"></div>
+  <div id="calibration"></div>
+
+  <div class="roi-area" style="margin-top:2rem;">
+    <button class="roi-btn" data-roi="PlayButton">Play</button>
+    <button class="roi-btn" data-roi="SettingsButton">Settings</button>
+    <button class="roi-btn" data-roi="ExitButton">Exit</button>
+  </div>
+
+  <script>
+    const gazeDot = document.getElementById('gaze-dot');
+    const calibContainer = document.getElementById('calibration');
+    const startCalibBtn = document.getElementById('start-calibration-btn');
+    const downloadBtn = document.getElementById('download-btn');
+    let fixationData = [];
+    let currentROI = null;
+    let fixationStart = null;
+    // Only collect fixation data when recording is active (e.g. inside the Play area)
+    let recordingActive = false;
+
+    async function setupWebgazer() {
+      console.log("Initializing WebGazer...");
+      await webgazer.setRegression('ridge')
+        .showVideoPreview(true)
+        .showPredictionPoints(false)
+        .begin();
+      startCalibBtn.style.display = 'inline-block';
+      // don't show download in the menu — recordings belong to the Play flow
+      webgazer.params.showVideoPreview = true;
+      webgazer.params.useMouseCalibration = false;
+
+      // Move video element safely
+      const vid = document.getElementById('webgazerVideoFeed');
+      if (vid && !document.getElementById('video-container').contains(vid)) {
+        document.getElementById('video-container').appendChild(vid);
+      }
+
+      webgazer.setGazeListener((data) => {
+        if (!data) return;
+        gazeDot.style.display = 'block';
+        gazeDot.style.transform = `translate(${data.x}px, ${data.y}px)`;
+
+        const element = document.elementFromPoint(data.x, data.y);
+        const roi = element?.dataset?.roi;
+
+        if (roi) {
+          if (currentROI !== roi) {
+            if (currentROI && fixationStart) {
+              const duration = Date.now() - fixationStart;
+              // only record when recordingActive is true
+              if (recordingActive) {
+                fixationData.push({roi: currentROI, start: new Date(fixationStart).toISOString(), end: new Date().toISOString(), duration});
+              }
+            }
+            currentROI = roi;
+            fixationStart = Date.now();
+          }
+        } else {
+          if (currentROI && fixationStart) {
+            const duration = Date.now() - fixationStart;
+            if (recordingActive) {
+              fixationData.push({roi: currentROI, start: new Date(fixationStart).toISOString(), end: new Date().toISOString(), duration});
+            }
+            currentROI = null;
+            fixationStart = null;
+          }
+        }
+      });
+    }
+
+    document.getElementById('enable-camera-btn').addEventListener('click', async () => {
+      try {
+        await setupWebgazer();
+      } catch (e) {
+        console.error("Camera setup failed:", e);
+        alert("Camera permission denied or blocked. Please reload and allow access.");
+      }
+    });
+
+    startCalibBtn.addEventListener('click', () => runCalibration());
+    downloadBtn.addEventListener('click', downloadCSV);
+
+    function createCalibrationDots() {
+      calibContainer.innerHTML = '';
+      const positions = [
+        [0.1, 0.1], [0.5, 0.1], [0.9, 0.1],
+        [0.1, 0.5], [0.5, 0.5], [0.9, 0.5],
+        [0.1, 0.9], [0.5, 0.9], [0.9, 0.9],
+      ];
+      positions.forEach(([x, y]) => {
+        const dot = document.createElement('div');
+        dot.classList.add('calib-dot');
+        dot.style.position = 'absolute';
+        dot.style.left = `${x * window.innerWidth - 20}px`;
+        dot.style.top = `${y * window.innerHeight - 20}px`;
+        calibContainer.appendChild(dot);
+      });
+    }
+
+    function runCalibration() {
+      createCalibrationDots();
+      calibContainer.style.display = 'flex';
+      calibContainer.style.pointerEvents = 'all';
+      const dots = [...calibContainer.children];
+      let index = 0;
+
+      function nextDot() {
+        if (index >= dots.length) {
+          endCalibration();
+          return;
+        }
+        const dot = dots[index];
+        dot.classList.add('active');
+        setTimeout(() => {
+          for (let i = 0; i < 20; i++) {
+            webgazer.recordScreenPosition(
+              parseFloat(dot.style.left) + 20,
+              parseFloat(dot.style.top) + 20
+            );
+          }
+          dot.classList.remove('active');
+          index++;
+          nextDot();
+        }, 1200);
+      }
+
+      // Failsafe: automatically end calibration after 15 seconds
+      setTimeout(() => {
+        if (calibContainer.style.display !== 'none') {
+          console.warn("Calibration timeout reached — closing overlay.");
+          endCalibration();
+        }
+      }, 15000);
+
+      nextDot();
+    }
+
+    function endCalibration() {
+      calibContainer.style.display = 'none';
+      calibContainer.style.pointerEvents = 'none';
+      calibContainer.innerHTML = '';
+      console.log("Calibration complete.");
+    }
+
+    function downloadCSV() {
+      if (fixationData.length === 0) {
+        alert('No fixation data yet!');
+        return;
+      }
+      const header = "ROI,Start,End,Duration(ms)\n";
+      const rows = fixationData.map(f =>
+        `${f.roi},${f.start},${f.end},${f.duration}`
+      ).join("\n");
+      const blob = new Blob([header + rows], { type: "text/csv" });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `fixation_data_${Date.now()}.csv`;
+      a.click();
+    }
+
+    // Clear overlays: hide large fixed/absolute fullscreen elements that dim the page
+    // This version is aggressive and records hidden elements so they can be restored.
+    function clearOverlays() {
+      const allowedIds = new Set(['calibration','webgazerVideoFeed','gaze-dot','enable-camera-btn','start-calibration-btn','download-btn','video-container']);
+      const viewportArea = window.innerWidth * window.innerHeight;
+      const els = Array.from(document.querySelectorAll('body *'));
+      let hidden = 0;
+      for (const el of els) {
+        try {
+          if (!el.style) continue;
+          if (el.id && allowedIds.has(el.id)) continue;
+          // avoid hiding our main controls
+          if (el.closest('.roi-area') || el.closest('#video-container')) continue;
+          const cs = window.getComputedStyle(el);
+
+          // prefer to hide fixed/absolute or very high z-index elements
+          const rect = el.getBoundingClientRect();
+          const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+          const areaRatio = area / Math.max(1, viewportArea);
+          const z = parseInt(cs.zIndex) || 0;
+
+          const bg = cs.backgroundColor || '';
+          const bgMatch = /rgba?\((\d+),\s*(\d+),\s*(\d+),\s*(0?\.?\d+)\)/i.exec(bg);
+          const alpha = bgMatch ? parseFloat(bgMatch[4]) : (cs.opacity ? parseFloat(cs.opacity) : 1);
+          const isDarkOverlay = bgMatch && alpha >= 0.12;
+          // check textual clues in id/class for common overlay/modal/backdrop
+          const idClass = ((el.id || '') + ' ' + (el.className || '')).toLowerCase();
+          const looksLikeOverlayName = /overlay|modal|backdrop|veil|dim|veil|scrim/.test(idClass);
+
+          // detect elements that cover nearly the full viewport
+          const coversFullscreen = rect.top <= 2 && rect.left <= 2 && rect.width >= window.innerWidth - 4 && rect.height >= window.innerHeight - 4;
+
+          const hasBackdrop = (cs.backdropFilter && cs.backdropFilter !== 'none') || (cs.backdropFilter === '') ? false : false;
+
+          // Conditions to hide:
+          // - covers a large portion of viewport (>30%) OR
+          // - semi-opaque background OR
+          // - very large z-index (>=1000) OR
+          // - fixed/absolute and covers >10% while somewhat transparent
+          const shouldHide = coversFullscreen || looksLikeOverlayName || (areaRatio > 0.30) || isDarkOverlay || (z >= 1000) || ((cs.position === 'fixed' || cs.position === 'absolute') && areaRatio > 0.10 && alpha < 0.95);
+
+          if (shouldHide) {
+            // Save original display so we can restore
+            if (typeof el.dataset._savedDisplay === 'undefined') el.dataset._savedDisplay = el.style.display || '';
+            el.dataset._clearedBy = 'clearOverlays';
+            el.style.display = 'none';
+            hidden++;
+            console.debug('clearOverlays: hiding', el, { areaRatio, z, alpha, pos: cs.position });
+          }
+        } catch (e) {
+          // ignore errors for some nodes
+        }
+      }
+      const statusEl = document.getElementById('status');
+      if (statusEl) {
+        statusEl.textContent = `Status: cleared ${hidden} overlay(s)`;
+        setTimeout(() => { statusEl.textContent = 'Status: ready'; }, 1500);
+      }
+      return hidden;
+    }
+
+    // Restore overlays previously hidden by clearOverlays()
+    function restoreOverlays() {
+      const els = Array.from(document.querySelectorAll('[data-_cleared-by="clearOverlays"]'));
+      let restored = 0;
+      for (const el of els) {
+        try {
+          el.style.display = el.dataset._savedDisplay || '';
+          delete el.dataset._clearedBy;
+          delete el.dataset._savedDisplay;
+          restored++;
+        } catch (e) {}
+      }
+      const statusEl = document.getElementById('status');
+      if (statusEl) {
+        statusEl.textContent = `Status: restored ${restored} overlay(s)`;
+        setTimeout(() => { statusEl.textContent = 'Status: ready'; }, 1500);
+      }
+      return restored;
+    }
+
+    // Aggressive one-pass clear for stubborn overlays (runs once)
+    function aggressiveClearOverlays() {
+      const viewportArea = window.innerWidth * window.innerHeight;
+      let hidden = 0;
+      for (const el of Array.from(document.querySelectorAll('body *'))) {
+        try {
+          const cs = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+          const areaRatio = area / Math.max(1, viewportArea);
+          const bg = cs.backgroundColor || '';
+          const bgMatch = /rgba?\((\d+),\s*(\d+),\s*(\d+),\s*(0?\.?\d+)\)/i.exec(bg);
+          const alpha = bgMatch ? parseFloat(bgMatch[4]) : (cs.opacity ? parseFloat(cs.opacity) : 1);
+          // hide if looks like dark fullscreen or semi-opaque overlay
+          if ((areaRatio > 0.25 && bgMatch && alpha > 0.05) || (rect.top <= 2 && rect.left <= 2 && rect.width >= window.innerWidth - 4 && rect.height >= window.innerHeight - 4)) {
+            if (typeof el.dataset._savedDisplay === 'undefined') el.dataset._savedDisplay = el.style.display || '';
+            el.dataset._clearedBy = 'clearOverlays';
+            el.style.display = 'none';
+            hidden++;
+          }
+        } catch (e) {}
+      }
+      console.debug('aggressiveClearOverlays hidden:', hidden);
+      return hidden;
+    }
+
+    // Hook clear/restore buttons
+    const clearBtn = document.getElementById('clear-overlays-btn');
+    if (clearBtn) clearBtn.addEventListener('click', clearOverlays);
+    const restoreBtn = document.getElementById('restore-overlays-btn');
+    if (restoreBtn) restoreBtn.addEventListener('click', restoreOverlays);
+
+    // Run immediately to remove accidental overlays, and watch for newly-added overlays
+    try { clearOverlays(); } catch (e) { /* ignore */ }
+    // also run an aggressive one-pass clear for stubborn overlays
+    try { aggressiveClearOverlays(); } catch (e) { /* ignore */ }
+
+    // Watch for overlay elements being added later and clear them automatically (debounced)
+    let _clearDebounce = null;
+    const _mo = new MutationObserver(() => {
+      if (_clearDebounce) clearTimeout(_clearDebounce);
+      _clearDebounce = setTimeout(() => {
+        try { clearOverlays(); } catch (e) { /* ignore */ }
+      }, 250);
+    });
+    try { _mo.observe(document.body, { childList: true, subtree: true, attributes: true }); } catch (e) { /* ignore if page not ready */ }
+
+    // Connect Play button to the Play page. This will navigate to play_test.html
+    // and (best-effort) pause/stop WebGazer here so the Play page can initialize its own session.
+    const playBtn = document.querySelector('.roi-btn[data-roi="PlayButton"]');
+    if (playBtn) {
+      playBtn.addEventListener('click', () => {
+        try {
+          if (window.webgazer) {
+            if (typeof webgazer.pause === 'function') webgazer.pause();
+            else if (typeof webgazer.end === 'function') webgazer.end();
+            else if (typeof webgazer.clearData === 'function') webgazer.clearData();
+          }
+        } catch (e) {
+          console.warn('Could not stop WebGazer before navigating:', e);
+        }
+        // Attempt to stop the visible preview feed if present
+        try {
+          const vid = document.getElementById('webgazerVideoFeed');
+          const s = vid && vid.srcObject;
+          if (s && typeof s.getTracks === 'function') s.getTracks().forEach(t => t.stop());
+        } catch (e) { /* ignore */ }
+
+        // Navigate to Play test page
+        window.location.href = 'play_test.html';
+      });
+    }
+  </script>
+</body>
+</html>

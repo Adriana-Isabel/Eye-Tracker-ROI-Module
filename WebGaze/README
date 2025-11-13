@@ -1,0 +1,74 @@
+Initial Testing of WebGazer.js for Webcam-Based Eye Tracking
+
+
+1. Overview
+    
+    WebGazer.js is a browser-based, webcam-powered eye-tracking library designed for quick prototyping and lightweight research applications. It runs entirely in HTML/JavaScript and requires no installation, making it an accessible option for early ROI-tracking experiments in games and other interactive systems.
+
+
+
+2. Setup & Ease of Use
+
+    The setup process is extremely simple—adding a <script> tag that loads WebGazer.js is enough to begin capturing gaze data. A basic test environment can be built using only a single HTML file. The library automatically handles webcam access, face detection, and gaze estimation, so the learning curve is minimal.
+
+    This simplicity makes WebGazer particularly appealing for rapid prototypes or classroom projects where time and computational resources are limited.
+
+
+
+3. Real-Time Gaze Visualization
+
+    During testing, the real-time visualization tool (the common red-dot cursor that follows estimated gaze position) worked but displayed noticeable instability. The dot tended to jump or jitter, especially when:
+
+    - lighting conditions were uneven,
+
+    - the head moved slightly,
+
+    - or the camera resolution was low.
+
+    This skittish behavior is expected in appearance-based webcam tracking, which lacks infrared illumination and high-resolution pupil tracking. However, the red-dot mode is mainly intended for debugging—not for research-grade accuracy.
+
+
+
+4. Fixation Detection
+
+    Despite the jittery movement during continuous tracking, WebGazer was able to detect fixation events more reliably. When the user looked at a single point on the screen for a brief period, the system stabilized enough to register consistent gaze estimates around that location.
+
+    For many ROI-based applications (e.g., determining which UI element or game asset the player is looking at), fixation-level tracking is often more valuable than perfectly smooth continuous gaze.
+
+
+
+5. Strengths Observed
+
+    - Very easy to use: Runs in any modern browser; no installation or dependencies.
+
+    - Lightweight: Works even on modest hardware.
+
+    - Fast setup for experiments: Ideal for rapid prototyping.
+
+    - Usable fixation detection: Despite noise, the system can reliably recognize when attention remains on a point.
+
+
+
+6. Limitations Observed
+
+    - Jitter during free-viewing: The real-time dot is unstable, especially with head movement.
+
+    - Lighting sensitivity: Uneven or dim lighting noticeably affects performance.
+
+    - Lower precision compared to IR-based or ML-based desktop trackers.
+
+    These limitations are expected for any RGB-webcam–based eye tracker and are consistent with reports from existing WebGazer literature.
+
+
+
+7. Suitability for ROI Tracking in Games
+
+    Even with some jitter, WebGazer.js is suitable for:
+
+    - detecting which region or UI element a player is looking at,
+
+    - capturing general attention patterns,
+
+    - running basic HCI or usability experiments.
+
+    As long as ROIs are reasonably sized (buttons, panels, HUD zones), WebGazer can provide useful data when paired with simple smoothing or a short calibration routine.

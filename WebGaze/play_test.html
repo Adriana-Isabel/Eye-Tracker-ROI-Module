@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Play Test — Gaze-Triggered Squares</title>
+  <script src="https://webgazer.cs.brown.edu/webgazer.js"></script>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{--bg:#071126;--card:#0b1220;--accent:#38bdf8;--text:#e6eef8}
+    html,body{height:100%;margin:0;background:linear-gradient(180deg,#071126 0%, #021024 100%);color:var(--text);font-family:Inter,system-ui,Arial,Helvetica}
+    .wrap{max-width:1100px;margin:20px auto;padding:18px}
+    header{display:flex;gap:12px;align-items:center}
+    h1{margin:0;font-size:1.25rem}
+    .controls{margin-top:12px}
+    button{background:var(--accent);color:#012; padding:8px 12px;border-radius:8px;border:none;cursor:pointer}
+    button:disabled{opacity:.5}
+    #arena{position:relative;margin-top:18px;height:70vh;border-radius:10px;background:rgba(255,255,255,0.02);overflow:hidden;border:1px solid rgba(255,255,255,0.03)}
+    .target{position:absolute;width:90px;height:90px;background:#f97316;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#032;font-weight:700;box-shadow:0 8px 20px rgba(0,0,0,0.45);transition:transform .1s ease}
+    .target.highlight{ box-shadow:0 0 30px 6px rgba(34,197,94,0.28); background:#34d399; color:#022; transform:scale(1.03);}
+    #statusLine{margin-top:12px;font-size:0.95rem}
+    #videoPreview{
+      position:fixed;left:12px;top:12px;width:180px;height:180px;
+      border-radius:10px;overflow:hidden;background:#000;
+      box-shadow:0 6px 20px rgba(0,0,0,0.6);z-index:100;
+    }
+    #videoPreview video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);}
+    /* gaze dot (single definition) */
+    #gazeDot {
+      position: fixed;
+      left: 0; top: 0;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: rgba(255,60,60,0.95);
+      box-shadow: 0 0 18px rgba(255,60,60,0.6);
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      z-index: 10001;
+      display: none;
+      transition: transform 0.06s linear;
+      will-change: left, top, transform;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Play Test — Gaze-Triggered Squares</h1>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        <button id="enableBtn">Enable Camera</button>
+        <button id="calibrateBtn" disabled>Calibrate</button>
+        <button id="playBtn">Start Test</button>
+        <button id="stopBtn" disabled style="background:#ef4444">Stop Recording</button>
+        <button id="downloadBtn" style="display:none;background:#10b981">Download CSV</button>
+        <div id="fixationIndicator" aria-live="polite" style="margin-left:12px;padding:6px 8px;border-radius:8px;background:rgba(255,255,255,0.04);color:#ddd;font-weight:600;font-size:0.9rem">Fixation: No</div>
+        <div id="debugPanel" style="margin-left:12px;padding:6px 8px;border-radius:8px;background:rgba(0,0,0,0.45);color:#ddd;font-size:0.8rem;min-width:220px">
+          <div style="margin-bottom:4px">Debug</div>
+          <div>Raw: <span id="dbgRaw">-</span></div>
+          <div>Smoothed: <span id="dbgSm">-</span></div>
+          <div>Conf: <span id="dbgConf">-</span></div>
+          <div>Inside: <span id="dbgInside">-</span></div>
+          <div style="margin-top:6px">Source: <select id="dbgSource"><option value="smoothed">Smoothed</option><option value="raw">Raw</option></select>
+            &nbsp; Conf Thresh: <input id="dbgConfThresh" type="number" step="0.01" min="0" max="1" value="0.05" style="width:64px"></div>
+        </div>
+      </div>
+    </header>
+
+    <div class="controls">
+      Trials: <input id="trialCount" type="number" value="8" min="1" max="40" style="width:70px"> &nbsp;
+      Fixation threshold (ms): <input id="fixDur" type="number" value="350" min="50" style="width:80px">
+    </div>
+
+    <div id="arena" aria-live="polite" aria-label="Test arena"></div>
+    <div id="calibrateOverlay" style="position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:10000;background:rgba(0,0,0,0.85)"></div>
+    <div id="statusLine">Status: idle</div>
+  </div>
+
+  <div id="videoPreview" hidden>
+    <video id="vgVideo" autoplay muted playsinline></video>
+  </div>
+  <div id="gazeDot" hidden></div>
+
+  <script>
+    const enableBtn = document.getElementById('enableBtn');
+    const playBtn = document.getElementById('playBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const arena = document.getElementById('arena');
+    const statusLine = document.getElementById('statusLine');
+    const trialCountInput = document.getElementById('trialCount');
+    const fixDurInput = document.getElementById('fixDur');
+    const videoPreview = document.getElementById('videoPreview');
+    const vgVideo = document.getElementById('vgVideo');
+    const gazeDot = document.getElementById('gazeDot');
+
+    let webgazerReady = false, running = false, gazeLoop = null;
+    let lastPrediction = null;
+    let trials = [], currentIndex = 0, records = [], fixationTimer = null, lastFixationEnd = null;
+    let calibrated = false;
+    // smoothing state for gaze dot
+    let gazeTarget = null;
+    let gazeX = NaN, gazeY = NaN;
+    // smoothing factor: 0..1 (lower = smoother/slower). Use `let` so it can be adjusted live.
+    let GAZE_ALPHA = 0.18;
+    // debug / detection helpers
+    let DBG_CONF_THRESHOLD = 0.05; // minimum confidence to accept a raw prediction
+    let DBG_USE_SOURCE = 'smoothed'; // 'smoothed' or 'raw'
+
+    function randBetween(min,max){return Math.round(min+Math.random()*(max-min));}
+
+    function buildTrials(n){
+      const rect = arena.getBoundingClientRect();
+      const margin=60, w=rect.width, h=rect.height, arr=[];
+      for(let i=0;i<n;i++){
+        arr.push({id:i+1,x:randBetween(margin,w-margin-90),y:randBetween(margin,h-margin-90)});
+      }
+      return arr;
+    }
+
+    async function setupWebgazer(){
+      statusLine.textContent='Status: initializing camera...';
+        await webgazer.setRegression('ridge').begin();
+        webgazer.showVideoPreview(false).showPredictionPoints(false).showFaceOverlay(true);
+        // Attach gaze listener to move the gaze dot immediately and store last prediction
+        webgazer.setGazeListener((data, elapsedTime) => {
+          // cache latest prediction and update gaze target for smoothing
+          lastPrediction = data;
+          if (!data || typeof data.x !== 'number' || typeof data.y !== 'number') { gazeTarget = null; return; }
+          // optional confidence/probability field check (defensive)
+          const conf = data.confidence ?? data.probability ?? data.weight ?? data.score ?? 1;
+          // expose current raw confidence for debug
+          try{ const dbgConfEl = document.getElementById('dbgConf'); if(dbgConfEl) dbgConfEl.textContent = (typeof conf === 'number' ? conf.toFixed(3) : String(conf)); }catch(e){}
+          if (typeof conf === 'number' && conf < DBG_CONF_THRESHOLD) { gazeTarget = null; return; }
+          gazeTarget = { x: data.x, y: data.y, conf };
+        });
+
+        // attach internal video to our preview element if available, otherwise fallback to getUserMedia
+        try{
+          const wgVid = (typeof webgazer.getVideoElement === 'function') ? webgazer.getVideoElement() : null;
+          if(wgVid && wgVid.srcObject){ vgVideo.srcObject = wgVid.srcObject; videoPreview.hidden=false; }
+          else {
+            // try direct camera access as fallback so the preview remains visible
+            try{
+              const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+              vgVideo.srcObject = stream; videoPreview.hidden = false; window._playPreviewStream = stream;
+            }catch(err){ console.warn('Camera fallback failed:', err); }
+          }
+        }catch(e){ console.warn('Could not attach video preview:', e); }
+
+        // attempt to style any face-overlay canvas (green mask)
+        try{
+          setTimeout(()=>{
+            const canvases = Array.from(document.querySelectorAll('canvas'));
+            canvases.forEach(c => {
+                try{
+                  // try to detect webgazer face-overlay canvas by z-index/size
+                  const cs = window.getComputedStyle(c);
+                  const rect = c.getBoundingClientRect();
+                  if (rect.width < 32 || rect.height < 32) return; // tiny canvases ignored
+                  // apply a subtle green mask overlay style
+                  c.style.background = 'rgba(34,197,94,0.06)';
+                  c.style.boxShadow = 'inset 0 0 0 9999px rgba(34,197,94,0.06)';
+                  c.style.mixBlendMode = 'multiply';
+                  c.style.borderRadius = '8px';
+                  c.style.pointerEvents = 'none';
+                  c.style.zIndex = 999;
+                }catch(e){}
+              });
+          }, 300);
+        }catch(e){}
+      webgazerReady=true;
+      gazeDot.hidden=false;
+      // enable calibration button
+      const calibrateBtnEl = document.getElementById('calibrateBtn');
+      if (calibrateBtnEl) { calibrateBtnEl.disabled = false; calibrateBtnEl.style.display = 'inline-block'; }
+      statusLine.textContent='Status: ready';
+    }
+
+    enableBtn.onclick=async()=>{
+      try{await setupWebgazer();}catch(e){alert('Camera permission required.');}
+      // gaze dot will be updated by webgazer's gaze listener
+    };
+
+    // Animation loop for smoothing the gaze dot movement (uses left/top so CSS centering works)
+    (function animateGaze(){
+      try{
+        if (gazeTarget && typeof gazeTarget.x === 'number') {
+          if (!isFinite(gazeX)) { gazeX = gazeTarget.x; gazeY = gazeTarget.y; }
+          gazeX += (gazeTarget.x - gazeX) * GAZE_ALPHA;
+          gazeY += (gazeTarget.y - gazeY) * GAZE_ALPHA;
+          gazeDot.style.display = 'block';
+          gazeDot.style.left = Math.round(gazeX) + 'px';
+          gazeDot.style.top = Math.round(gazeY) + 'px';
+        } else {
+          // no target: gently hold current position but hide after small idle
+          if (gazeDot.style.display === 'block') {
+            // slowly decay visibility (don't abruptly hide to avoid flicker)
+            // keep dot where it is but reduce visibility after a short delay
+            // we won't change position here to avoid jumps
+          }
+        }
+      }catch(e){/* ignore animation errors */}
+      requestAnimationFrame(animateGaze);
+    })();
+
+    // helper to update debug UI values
+    function updateDebugUI(raw, smoothed, inside){
+      try{
+        const rEl = document.getElementById('dbgRaw');
+        const sEl = document.getElementById('dbgSm');
+        const inEl = document.getElementById('dbgInside');
+        if(rEl) rEl.textContent = raw && isFinite(raw.x) ? `${Math.round(raw.x)},${Math.round(raw.y)}` : '-';
+        if(sEl) sEl.textContent = (isFinite(smoothed.x) ? `${Math.round(smoothed.x)},${Math.round(smoothed.y)}` : '-');
+        if(inEl) inEl.textContent = (inside? 'YES' : 'no');
+      }catch(e){}
+    }
+
+    // Create a small control panel for adjusting gaze smoothing live
+    function initGazeSmoothingControls(){
+      try{
+        // avoid creating twice
+        if(document.getElementById('gazeSmoothingCtrl')) return;
+        const ctrl = document.createElement('div');
+        ctrl.style.position = 'fixed';
+        ctrl.style.top = '12px';
+        ctrl.style.right = '12px';
+        ctrl.style.background = 'rgba(0,0,0,0.45)';
+        ctrl.style.color = '#fff';
+        ctrl.style.padding = '6px 8px';
+        ctrl.style.borderRadius = '6px';
+        ctrl.style.fontSize = '13px';
+        ctrl.style.zIndex = 100000;
+        ctrl.id = 'gazeSmoothingCtrl';
+
+        const label = document.createElement('label');
+        label.textContent = 'Gaze smoothness';
+        label.style.marginRight = '8px';
+        label.style.display = 'inline-block';
+
+        const input = document.createElement('input');
+        input.type = 'range';
+        input.min = 0.02; input.max = 0.5; input.step = 0.01; input.value = GAZE_ALPHA;
+        input.style.verticalAlign = 'middle'; input.style.width = '140px';
+
+        const valueSpan = document.createElement('span');
+        valueSpan.id = 'gazeAlphaValue'; valueSpan.textContent = Number(GAZE_ALPHA).toFixed(2);
+        valueSpan.style.marginLeft = '8px'; valueSpan.style.minWidth = '40px'; valueSpan.style.display='inline-block';
+
+        input.addEventListener('input', (e)=>{
+          const v = parseFloat(e.target.value);
+          if(!isNaN(v)){ GAZE_ALPHA = v; valueSpan.textContent = v.toFixed(2); }
+        });
+
+        ctrl.appendChild(label); ctrl.appendChild(input); ctrl.appendChild(valueSpan);
+        document.body.appendChild(ctrl);
+      }catch(e){console.warn('Could not init gaze smoothing controls',e);}    
+    }
+
+    // Calibrate button
+    const calibrateBtn = document.getElementById('calibrateBtn');
+    if (calibrateBtn) calibrateBtn.addEventListener('click', runCalibration);
+
+    function showTarget(t){
+      arena.innerHTML='';
+      const el=document.createElement('div');
+      el.className='target'; el.style.left=t.x+'px'; el.style.top=t.y+'px';
+      el.textContent=t.id; el.dataset.tid=t.id; arena.appendChild(el); return el;
+    }
+
+    // Calibration utilities
+    function createCalDots() {
+      const overlay = document.getElementById('calibrateOverlay');
+      overlay.innerHTML = '';
+      const positions = [
+        [0.1,0.1],[0.5,0.1],[0.9,0.1],
+        [0.1,0.5],[0.5,0.5],[0.9,0.5],
+        [0.1,0.9],[0.5,0.9],[0.9,0.9]
+      ];
+      positions.forEach(([nx,ny])=>{
+        const d=document.createElement('div');
+        d.style.position='absolute'; d.style.width='36px'; d.style.height='36px'; d.style.borderRadius='50%';
+        d.style.left = `${Math.round(window.innerWidth*nx - 18)}px`;
+        d.style.top = `${Math.round(window.innerHeight*ny - 18)}px`;
+        d.style.background='#60a5fa'; d.style.boxShadow='0 8px 20px rgba(0,0,0,0.6)';
+        overlay.appendChild(d);
+      });
+    }
+
+    async function runCalibration(){
+      if(!webgazerReady){ alert('Enable camera first'); return; }
+      const overlay = document.getElementById('calibrateOverlay');
+      overlay.style.display = 'flex'; overlay.style.pointerEvents='all';
+      createCalDots();
+      const dots = [...overlay.children];
+      for(let i=0;i<dots.length;i++){
+        const dot = dots[i]; dot.style.transform='scale(1.3)';
+        const x = parseFloat(dot.style.left) + 18; const y = parseFloat(dot.style.top) + 18;
+        for(let k=0;k<25;k++){ if(webgazer && webgazer.recordScreenPosition) webgazer.recordScreenPosition(x,y); await new Promise(r=>setTimeout(r,60)); }
+        dot.style.transform='scale(1)'; await new Promise(r=>setTimeout(r,200));
+      }
+      overlay.style.display='none'; overlay.innerHTML=''; calibrated=true;
+      statusLine.textContent='Status: calibrated — ready';
+    }
+
+    function startTest(){
+      if(!webgazerReady){alert('Enable camera first.');return;}
+      records=[]; trials=buildTrials(parseInt(trialCountInput.value,10)||8);
+      currentIndex=0; running=true;
+      playBtn.disabled=true; stopBtn.disabled=false; enableBtn.disabled=true;
+      statusLine.textContent='Running test...';
+      showNextTrial();
+
+      gazeLoop=setInterval(()=>{
+        const pred = lastPrediction || (webgazer.getCurrentPrediction ? webgazer.getCurrentPrediction() : null);
+        // read debug UI choices
+        try{
+          const sel = document.getElementById('dbgSource'); if(sel) DBG_USE_SOURCE = sel.value;
+          const thr = document.getElementById('dbgConfThresh'); if(thr) DBG_CONF_THRESHOLD = parseFloat(thr.value) || DBG_CONF_THRESHOLD;
+        }catch(e){}
+
+        if(!pred && !isFinite(gazeX)) return; // nothing to do
+        const tgt = arena.querySelector('.target');
+        if(!tgt) return;
+
+        // decide which coordinates to use
+        const rawX = pred ? pred.x : NaN, rawY = pred ? pred.y : NaN;
+        const smX = isFinite(gazeX) ? gazeX : NaN, smY = isFinite(gazeY) ? gazeY : NaN;
+        let gx = NaN, gy = NaN;
+        if(DBG_USE_SOURCE === 'smoothed' && isFinite(smX) && isFinite(smY)){ gx = smX; gy = smY; }
+        else if(DBG_USE_SOURCE === 'raw' && isFinite(rawX) && isFinite(rawY)){ gx = rawX; gy = rawY; }
+        else { // fallback
+          gx = isFinite(smX) ? smX : rawX; gy = isFinite(smY) ? smY : rawY;
+        }
+
+        if(!isFinite(gx) || !isFinite(gy)) return;
+
+        const TOL = 18; // pixels tolerance
+        const r = tgt.getBoundingClientRect();
+        const inside = (gx >= (r.left - TOL) && gx <= (r.right + TOL) && gy >= (r.top - TOL) && gy <= (r.bottom + TOL));
+
+        // update debug UI
+        updateDebugUI({x:rawX,y:rawY}, {x:smX,y:smY}, inside);
+
+        const fixIndicator = document.getElementById('fixationIndicator');
+        if(inside){
+          if(!tgt.classList.contains('highlight')) tgt.classList.add('highlight');
+          if(fixIndicator){ fixIndicator.textContent = 'Fixation: Yes'; fixIndicator.style.background = 'rgba(16,185,129,0.12)'; fixIndicator.style.color = '#9ef6d7'; }
+          if(!fixationTimer){
+            fixationTimer = { startPerf: performance.now(), startWall: Date.now(), x: gx, y: gy };
+          } else {
+            const dur = performance.now() - fixationTimer.startPerf;
+            if(dur >= (parseInt(fixDurInput.value,10) || 350)){
+              const endPerf = performance.now(), endWall = Date.now();
+              const fixationDur = Math.round(endPerf - fixationTimer.startPerf);
+              const interFix = (lastFixationEnd ? fixationTimer.startWall - lastFixationEnd : null);
+              records.push({
+                trial: trials[currentIndex].id,
+                start_ISO: new Date(fixationTimer.startWall).toISOString(),
+                end_ISO: new Date(endWall).toISOString(),
+                duration_ms: fixationDur,
+                inter_fixation_ms: interFix
+              });
+              lastFixationEnd = fixationTimer.startWall + fixationDur;
+              tgt.remove(); fixationTimer = null;
+              statusLine.textContent = `Trial ${trials[currentIndex].id} done (${fixationDur}ms)`;
+              if(fixIndicator){ fixIndicator.textContent = 'Fixation: No'; fixIndicator.style.background = 'rgba(255,255,255,0.04)'; fixIndicator.style.color = '#ddd'; }
+              setTimeout(()=>{ currentIndex++; currentIndex < trials.length ? showNextTrial() : finishTest(); }, 600);
+            }
+          }
+        } else {
+          // not inside
+          fixationTimer = null;
+          if(fixIndicator){ fixIndicator.textContent = 'Fixation: No'; fixIndicator.style.background = 'rgba(255,255,255,0.04)'; fixIndicator.style.color = '#ddd'; }
+          const t = arena.querySelector('.target'); if(t) t.classList.remove('highlight');
+        }
+      },50);
+    }
+
+    function showNextTrial(){
+      const t=trials[currentIndex];
+      if(!t){finishTest();return;}
+      showTarget(t);
+      statusLine.textContent=`Trial ${currentIndex+1}/${trials.length}`;
+    }
+
+    function finishTest(){
+      running=false; clearInterval(gazeLoop);
+      playBtn.disabled=false; stopBtn.disabled=true; enableBtn.disabled=false;
+      fixationTimer=null; gazeLoop=null;
+      statusLine.textContent=`Test finished — ${records.length} fixations recorded`;
+      arena.innerHTML='';
+      if(records.length){
+        const header='trial,start_ISO,end_ISO,duration_ms,inter_fixation_ms\n';
+        const rows=records.map(r=>`${r.trial},${r.start_ISO},${r.end_ISO},${r.duration_ms},${r.inter_fixation_ms??''}`).join('\n');
+        const csv=header+rows;
+        const blob=new Blob([csv],{type:'text/csv'});
+        const url=URL.createObjectURL(blob);
+        downloadBtn.style.display='inline-block';
+        downloadBtn.onclick=()=>{
+          const a=document.createElement('a');
+          a.href=url;a.download=`fixations_${Date.now()}.csv`;a.click();a.remove();
+        };
+      }
+    }
+
+    stopBtn.onclick=()=>{if(running)finishTest();};
+    playBtn.onclick=()=>startTest();
+
+    // initialize gaze smoothing control UI
+    initGazeSmoothingControls();
+  </script>
+</body>
+</html>
