@@ -1,20 +1,12 @@
 body {
   background: #111;
   color: white;
-  font-family: sans-serif;
-  text-align: center;
-}
-
-#container {
-  position: relative;
-  width: 640px;
-  margin: 20px auto;
+  font-family: Arial;
 }
 
 video, canvas {
   width: 640px;
   height: 480px;
-  position: absolute;
-  left: 0;
-  top: 0;
+  display: block;
+  margin-top: 10px;
 }

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>MediaPipe Gaze Test</title>
+  <link rel="stylesheet" href="style.css">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+</head>
+<body>
+  <div style="max-width:1100px;margin:18px auto;color:white;font-family:Arial">
+    <header style="display:flex;align-items:center;gap:12px">
+      <h1 style="margin:0;font-size:1.2rem">MediaPipe Gaze — Test</h1>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        <button id="enableBtn">Enable Camera</button>
+        <button id="calibrateBtn" disabled>Calibrate</button>
+        <button id="playBtn">Start Test</button>
+        <button id="stopBtn" disabled style="background:#ef4444">Stop</button>
+      </div>
+    </header>
+
+    <div style="margin-top:12px">Trials: <input id="trialCount" type="number" value="8" min="1" max="40" style="width:70px"> &nbsp; Fixation (ms): <input id="fixDur" type="number" value="350" min="50" style="width:80px"></div>
+
+    <div id="arena" style="position:relative;margin-top:18px;height:70vh;border-radius:10px;background:rgba(255,255,255,0.02);overflow:hidden;border:1px solid rgba(255,255,255,0.03)"></div>
+    <div id="statusLine" style="margin-top:8px">Status: idle</div>
+  </div>
+
+  <!-- hidden video/canvas for face-mesh processing -->
+  <div style="position:fixed;right:12px;top:12px;width:220px;height:140px;border-radius:8px;overflow:hidden;background:#000;z-index:100">
+    <video id="inputVideo" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;transform:scaleX(-1);"></video>
+    <canvas id="outputCanvas" width="640" height="480" 
+        style="position:fixed;right:12px;top:12px;width:220px;
+               height:140px;z-index:100;pointer-events:none"></canvas>
+
+  </div>
+
+  <div id="gazeDot" style="position:fixed;left:0;top:0;width:18px;height:18px;border-radius:50%;background:rgba(255,60,60,0.95);pointer-events:none;transform:translate(-50%,-50%);z-index:10001;display:none"></div>
+
+  <div id="calibrateOverlay" style="position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:10000;background:rgba(0,0,0,0.8)"></div>
+
+  <script type="module" src="mediapipe_gaze.js"></script>
+</body>
+</html>

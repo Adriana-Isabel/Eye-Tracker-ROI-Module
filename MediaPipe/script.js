@@ -6,6 +6,7 @@ const video = document.getElementById("inputVideo");
 const canvas = document.getElementById("outputCanvas");
 const ctx = canvas.getContext("2d");
 
+// Setup FaceMesh
 const faceMesh = new FaceMesh({
   locateFile: (file) =>
     `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`,
@@ -13,27 +14,34 @@ const faceMesh = new FaceMesh({
 
 faceMesh.setOptions({
   maxNumFaces: 1,
-  refineLandmarks: true,
+  refineLandmarks: true, // includes iris landmarks
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5
 });
 
 faceMesh.onResults((results) => {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // draw camera feed
   ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
 
-  if (results.multiFaceLandmarks.length > 0) {
-    const points = results.multiFaceLandmarks[0];
-    drawPoint(points[33], "red");
-    drawPoint(points[133], "red");
-  }
+  if (!results.multiFaceLandmarks[0]) return;
+
+  const pts = results.multiFaceLandmarks[0];
+
+  // Draw IRIS landmarks
+  drawPoint(pts[468], "red"); // left iris center
+  drawPoint(pts[473], "blue"); // right iris center
 });
 
 function drawPoint({ x, y }, color) {
   ctx.fillStyle = color;
   ctx.beginPath();
-  ctx.arc(x * canvas.width, y * canvas.height, 4, 0, 2 * Math.PI);
+  ctx.arc(x * canvas.width, y * canvas.height, 4, 0, Math.PI * 2);
   ctx.fill();
 }
 
+// Setup camera
 const camera = new Camera(video, {
   onFrame: async () => {
     await faceMesh.send({ image: video });
