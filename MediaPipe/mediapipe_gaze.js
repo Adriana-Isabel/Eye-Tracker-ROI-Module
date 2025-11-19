@@ -2,6 +2,9 @@ import "https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js";
 import "https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js";
 import "https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js";
 
+/* -----------------------
+   DOM refs
+   ----------------------- */
 const video = document.getElementById('inputVideo');
 const canvas = document.getElementById('outputCanvas');
 const ctx = canvas.getContext('2d');
@@ -10,14 +13,42 @@ const calibrateBtn = document.getElementById('calibrateBtn');
 const enableBtn = document.getElementById('enableBtn');
 const playBtn = document.getElementById('playBtn');
 const stopBtn = document.getElementById('stopBtn');
+const downloadBtn = document.getElementById('downloadBtn');
 const arena = document.getElementById('arena');
 const statusLine = document.getElementById('statusLine');
+const vgVideo = document.getElementById('vgVideo');
+const fixationIndicator = document.getElementById('fixationIndicator');
+const dbgRawEl = document.getElementById('dbgRaw');
+const dbgSmEl = document.getElementById('dbgSm');
+const dbgConfEl = document.getElementById('dbgConf');
+const dbgInsideEl = document.getElementById('dbgInside');
+const dbgSourceSel = document.getElementById('dbgSource');
+const dbgConfThreshInput = document.getElementById('dbgConfThresh');
+const gazeSmoothInput = document.getElementById('gazeSmooth');
+const gazeAlphaValueEl = document.getElementById('gazeAlphaValue');
+const showGazeDotCheckbox = document.getElementById('showGazeDot');
+const calibrateOverlay = document.getElementById('calibrateOverlay');
+const trialCountInput = document.getElementById('trialCount');
+const fixDurInput = document.getElementById('fixDur');
 
+/* -----------------------
+   State
+   ----------------------- */
 let camera = null;
-let currentIris = null; // {x,y} normalized
-let mapping = null; // function to map normalized iris->page coords
+let currentIris = null; // {x,y} normalized in FaceMesh image coords
+let mapping = null;     // function(norm)->page coords
+let videoRect = null;   // bounding rect of the preview video (used for calibration & fallback)
+let csvUrl = null;
 
-// FaceMesh setup
+/* gaze state */
+let gazeX = NaN, gazeY = NaN;
+let gazeAlpha = parseFloat(gazeSmoothInput?.value || 0.18);
+let trials = [], currentIndex = 0, records = [], running = false, gazeLoop = null;
+let fixationTimer = null;
+
+/* -----------------------
+   FaceMesh
+   ----------------------- */
 const faceMesh = new FaceMesh({
   locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
 });
@@ -29,24 +60,19 @@ faceMesh.setOptions({
 });
 
 faceMesh.onResults((results) => {
-
-  // clear canvas
+  // draw frame to hidden canvas (optional)
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (results.image) ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
 
-  // draw the video frame
-  if (results.image) {
-    ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
-  }
-
-  // no face → stop
   if (!results.multiFaceLandmarks || !results.multiFaceLandmarks[0]) {
     currentIris = null;
+    if (dbgConfEl) dbgConfEl.textContent = '-';
     return;
   }
 
   const pts = results.multiFaceLandmarks[0];
 
-  // iris centers
+  // iris center landmarks (MediaPipe refined)
   const left = pts[468];
   const right = pts[473];
 
@@ -55,27 +81,30 @@ faceMesh.onResults((results) => {
     y: (left.y + right.y) / 2
   };
 
-  // ------- draw dots on eyes -------
-  function drawDot(pt, color) {
+  // debug conf (we currently use presence as 1.0)
+  if (dbgConfEl) dbgConfEl.textContent = '1.00';
+
+  // draw small debug dots (on canvas)
+  const drawDot = (pt, color) => {
     ctx.beginPath();
     ctx.arc(pt.x * canvas.width, pt.y * canvas.height, 4, 0, Math.PI * 2);
     ctx.fillStyle = color;
     ctx.fill();
-  }
+  };
+  drawDot(left, "#00ffea");
+  drawDot(right, "#ff00aa");
 
-  drawDot(left, "#00ffea");   // left iris
-  drawDot(right, "#ff00aa");  // right iris
-
-  // Optional: draw face mesh
+  // optional mesh points (comment out if noisy)
   for (let i = 0; i < pts.length; i++) {
     const p = pts[i];
-    ctx.fillStyle = "rgba(255,255,255,0.5)";
-    ctx.fillRect(p.x * canvas.width, p.y * canvas.height, 1.5, 1.5);
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    ctx.fillRect(p.x * canvas.width, p.y * canvas.height, 1.2, 1.2);
   }
 });
 
-
-// small linear algebra helpers for 3x3 inversion
+/* -----------------------
+   Math helpers
+   ----------------------- */
 function invert3x3(m){
   const a=m;
   const det = a[0]* (a[4]*a[8]-a[5]*a[7]) - a[1]*(a[3]*a[8]-a[5]*a[6]) + a[2]*(a[3]*a[7]-a[4]*a[6]);
@@ -95,24 +124,21 @@ function invert3x3(m){
 }
 
 function computeAffine(samples){
-  // samples: [{nx,ny, tx,ty}, ...]
+  // samples: [{nx,ny, tx,ty}, ...]  (tx/ty page coords)
   const N = samples.length;
   if(N < 3) return null;
-  // build M (Nx3) and bx, by
-  const MTM = [0,0,0, 0,0,0, 0,0,0]; // 3x3
+  const MTM = [0,0,0, 0,0,0, 0,0,0];
   const Mtbx = [0,0,0];
   const Mtby = [0,0,0];
   for(const s of samples){
     const x = s.nx, y = s.ny, w = 1;
     const row = [x,y,w];
-    // accumulate MTM = M^T * M
     for(let i=0;i<3;i++) for(let j=0;j<3;j++) MTM[i*3+j] += row[i]*row[j];
     Mtbx[0] += row[0]*s.tx; Mtbx[1] += row[1]*s.tx; Mtbx[2] += row[2]*s.tx;
     Mtby[0] += row[0]*s.ty; Mtby[1] += row[1]*s.ty; Mtby[2] += row[2]*s.ty;
   }
   const inv = invert3x3(MTM);
   if(!inv) return null;
-  // solution a = inv(MTM) * M^T * b  -> a is length 3
   function mulInvVec(invMat, vec){
     return [
       invMat[0]*vec[0] + invMat[1]*vec[1] + invMat[2]*vec[2],
@@ -122,7 +148,6 @@ function computeAffine(samples){
   }
   const ax = mulInvVec(inv, Mtbx);
   const ay = mulInvVec(inv, Mtby);
-  // mapping function
   return function(norm){
     const X = ax[0]*norm.x + ax[1]*norm.y + ax[2];
     const Y = ay[0]*norm.x + ay[1]*norm.y + ay[2];
@@ -130,11 +155,22 @@ function computeAffine(samples){
   };
 }
 
-// calibration utilities
+/* -----------------------
+   Calibration helpers
+   ----------------------- */
+function updateVideoRect(){
+  // prefer preview element vgVideo; fallback to input video
+  videoRect = (vgVideo && vgVideo.getBoundingClientRect && vgVideo.getBoundingClientRect().width > 0)
+    ? vgVideo.getBoundingClientRect()
+    : (video.getBoundingClientRect ? video.getBoundingClientRect() : {left:0,top:0,width:window.innerWidth,height:window.innerHeight});
+}
+
 function createCalDots(){
-  const overlay = document.getElementById('calibrateOverlay');
-  overlay.innerHTML = '';
-  overlay.style.display = 'flex';
+  updateVideoRect();
+  calibrateOverlay.innerHTML = '';
+  calibrateOverlay.style.display = 'flex';
+  calibrateOverlay.style.alignItems = 'flex-start';
+  // 3x3 grid, positions relative to videoRect
   const positions = [
     [0.1,0.1],[0.5,0.1],[0.9,0.1],
     [0.1,0.5],[0.5,0.5],[0.9,0.5],
@@ -142,53 +178,88 @@ function createCalDots(){
   ];
   for(const [nx,ny] of positions){
     const d = document.createElement('div');
-    d.style.position='absolute'; d.style.width='36px'; d.style.height='36px'; d.style.borderRadius='50%';
-    d.style.left = `${Math.round(window.innerWidth*nx - 18)}px`;
-    d.style.top = `${Math.round(window.innerHeight*ny - 18)}px`;
-    d.style.background='#60a5fa'; d.style.boxShadow='0 8px 20px rgba(0,0,0,0.6)';
-    overlay.appendChild(d);
+    d.className = 'cal-dot';
+    d.style.position = 'fixed';
+    const cx = Math.round(videoRect.left + nx * videoRect.width);
+    const cy = Math.round(videoRect.top  + ny * videoRect.height);
+    // place at center, then adjust after insert using actual element size
+    d.style.left = `${cx}px`;
+    d.style.top = `${cy}px`;
+    calibrateOverlay.appendChild(d);
+    // center by subtracting half width/height (reads computed size)
+    const rect = d.getBoundingClientRect();
+    d.style.left = `${Math.round(cx - rect.width/2)}px`;
+    d.style.top = `${Math.round(cy - rect.height/2)}px`;
   }
 }
 
 async function runCalibration(){
   if(!camera) { alert('Enable camera first'); return; }
   statusLine.textContent = 'Calibration: follow dots';
-  const overlay = document.getElementById('calibrateOverlay');
   createCalDots();
-  const dots = Array.from(overlay.children);
+  const dots = Array.from(calibrateOverlay.children);
   const samples = [];
-  for(let i=0;i<dots.length;i++){
-    const dot = dots[i];
-    dot.style.transform='scale(1.3)';
-    const centerX = parseFloat(dot.style.left) + 18; const centerY = parseFloat(dot.style.top) + 18;
-    // collect iris samples for 700ms
-    const collected = [];
-    const t0 = performance.now();
-    while(performance.now() - t0 < 700){
-      if(currentIris) collected.push({nx: currentIris.x, ny: currentIris.y});
-      await new Promise(r=>setTimeout(r,40));
+  // ensure cleanup even if something goes wrong while sampling
+  try{
+    for(let i=0;i<dots.length;i++){
+      const dot = dots[i];
+      try{
+        dot.style.transform='scale(1.25)';
+        const rect = dot.getBoundingClientRect();
+        const centerX = rect.left + rect.width/2;
+        const centerY = rect.top + rect.height/2;
+        const collected = [];
+        const t0 = performance.now();
+        while(performance.now() - t0 < 700){
+          if(currentIris) collected.push({nx: currentIris.x, ny: currentIris.y});
+          await new Promise(r=>setTimeout(r,40));
+        }
+        if(collected.length === 0){
+          console.warn('No iris samples for dot', i);
+        } else {
+          // simple median-based outlier rejection per axis
+          const xs = collected.map(s=>s.nx).sort((a,b)=>a-b);
+          const ys = collected.map(s=>s.ny).sort((a,b)=>a-b);
+          const medianX = xs[Math.floor(xs.length/2)];
+          const medianY = ys[Math.floor(ys.length/2)];
+          // keep near-median samples
+          const filt = collected.filter(s => Math.abs(s.nx - medianX) < 0.12 && Math.abs(s.ny - medianY) < 0.12);
+          const use = filt.length >= 3 ? filt : collected;
+          const avgX = use.reduce((s,v)=>s+v.nx,0)/use.length;
+          const avgY = use.reduce((s,v)=>s+v.ny,0)/use.length;
+          samples.push({nx: avgX, ny: avgY, tx: centerX, ty: centerY});
+        }
+      }finally{
+        // always reset visual state for this dot
+        try{ dots[i].style.transform = 'scale(1)'; }catch(e){}
+      }
+      await new Promise(r=>setTimeout(r,200));
     }
-    // average
-    if(collected.length === 0){
-      // mark and continue (could repeat), but push an invalid sample
-      console.warn('No iris samples for dot', i);
-    } else {
-      const avgX = collected.reduce((s,v)=>s+v.nx,0)/collected.length;
-      const avgY = collected.reduce((s,v)=>s+v.ny,0)/collected.length;
-      samples.push({nx: avgX, ny: avgY, tx: centerX, ty: centerY});
-    }
-    dot.style.transform='scale(1)';
-    await new Promise(r=>setTimeout(r,200));
+  }finally{
+    // final cleanup: hide and clear overlay; ensure any stray dots are removed
+    setTimeout(()=>{
+      try{ calibrateOverlay.style.display = 'none'; }catch(e){}
+      try{ calibrateOverlay.innerHTML = ''; }catch(e){}
+    }, 60);
   }
-  overlay.style.display='none'; overlay.innerHTML='';
-  if(samples.length < 3){ alert('Calibration failed — not enough samples'); statusLine.textContent='Status: calibration failed'; return; }
+  if(samples.length < 3){
+    alert('Calibration failed — not enough samples');
+    statusLine.textContent='Status: calibration failed';
+    return;
+  }
   mapping = computeAffine(samples);
-  if(!mapping){ alert('Could not compute mapping'); statusLine.textContent='Status: calibration failed'; return; }
+  if(!mapping){
+    alert('Could not compute mapping');
+    statusLine.textContent='Status: calibration failed';
+    return;
+  }
   statusLine.textContent='Status: calibrated';
   calibrateBtn.disabled = false;
 }
 
-// Enable camera and start FaceMesh
+/* -----------------------
+   Camera
+   ----------------------- */
 async function enableCamera(){
   if(camera) return;
   statusLine.textContent = 'Status: starting camera...';
@@ -199,52 +270,174 @@ async function enableCamera(){
   await camera.start();
   statusLine.textContent = 'Status: camera ready';
   calibrateBtn.disabled = false;
-  gazeDot.style.display = 'block';
+  // keep gaze dot hidden until we have a valid mapped gaze
+  try{ gazeDot.style.display = 'none'; }catch(e){}
+  try{
+    if(video && video.srcObject && vgVideo){ vgVideo.srcObject = video.srcObject; vgVideo.play().catch(()=>{}); }
+  }catch(e){}
+  updateVideoRect();
 }
 
 enableBtn.onclick = async ()=>{ try{ await enableCamera(); }catch(e){ alert('Camera permission required.'); console.error(e); } };
 calibrateBtn.onclick = async ()=>{ await runCalibration(); };
 
-// simple play test harness (build random targets, detect fixation)
+/* -----------------------
+   Trials / fixation test
+   ----------------------- */
 function randBetween(min,max){ return Math.round(min + Math.random()*(max-min)); }
-function buildTrials(n){ const rect = arena.getBoundingClientRect(); const arr=[]; const margin=60; for(let i=0;i<n;i++){ arr.push({id:i+1,x:randBetween(margin,rect.width-margin-90),y:randBetween(margin,rect.height-margin-90)}); } return arr; }
+function buildTrials(n){
+  const rect = arena.getBoundingClientRect();
+  const arr=[]; const margin=60;
+  for(let i=0;i<n;i++){
+    arr.push({id:i+1,x:randBetween(margin,rect.width-margin-90),y:randBetween(margin,rect.height-margin-90)});
+  }
+  return arr;
+}
 
-let trials = [], currentIndex = 0, records = [], running = false, gazeLoop = null, fixationTimer = null, lastPrediction = null;
-let gazeX = NaN, gazeY = NaN, gazeAlpha = 0.18; // smoothing
-
-function showTarget(t){ arena.innerHTML=''; const el = document.createElement('div'); el.className='target'; el.style.left = t.x + 'px'; el.style.top = t.y + 'px'; el.textContent = t.id; arena.appendChild(el); return el; }
+function showTarget(t){
+  arena.innerHTML='';
+  const el = document.createElement('div');
+  el.className='target';
+  el.style.position='absolute';
+  el.style.left = t.x + 'px';
+  el.style.top = t.y + 'px';
+  el.textContent = t.id;
+  arena.appendChild(el);
+  return el;
+}
 
 function startTest(){
   if(!camera){ alert('Enable camera first'); return; }
-  records = []; trials = buildTrials(parseInt(document.getElementById('trialCount').value,10)||8);
-  currentIndex = 0; running = true; playBtn.disabled = true; stopBtn.disabled = false; enableBtn.disabled = true; statusLine.textContent = 'Running test...';
+  records = []; trials = buildTrials(parseInt(trialCountInput?.value || 8,10) || 8);
+  currentIndex = 0; running = true; playBtn.disabled = true; stopBtn.disabled = false; enableBtn.disabled = true;
+  statusLine.textContent = 'Running test...';
   showNextTrial();
-  gazeLoop = setInterval(()=>{
-    if(!currentIris && !isFinite(gazeX)) return;
+  // keep using the single animate loop for gaze updates; but we still use interval for logic checks
+  gazeLoop = setInterval(()=> {
+    if(!isFinite(gazeX) && !currentIris) return;
     const tgt = arena.querySelector('.target'); if(!tgt) return;
-    // map using mapping or fallback
-    let mapped = null;
-    if(mapping && currentIris) mapped = mapping(currentIris);
-    else if(currentIris){ mapped = { x: currentIris.x * window.innerWidth, y: currentIris.y * window.innerHeight }; }
-    if(!mapped) return;
-    // smoothing
-    if(!isFinite(gazeX)){ gazeX = mapped.x; gazeY = mapped.y; }
-    gazeX += (mapped.x - gazeX) * gazeAlpha; gazeY += (mapped.y - gazeY) * gazeAlpha;
-    gazeDot.style.left = Math.round(gazeX) + 'px'; gazeDot.style.top = Math.round(gazeY) + 'px'; gazeDot.style.display = 'block';
 
+    const dbgConfThresh = parseFloat(dbgConfThreshInput?.value || '0.05');
+    const dbgSource = dbgSourceSel?.value || 'smoothed';
+
+    // pick source for test: 'raw' (not used) or 'smoothed' (gazeX/gazeY)
+    const gx = gazeX, gy = gazeY;
     const r = tgt.getBoundingClientRect(); const TOL = 18;
-    const inside = (gazeX >= (r.left - TOL) && gazeX <= (r.right + TOL) && gazeY >= (r.top - TOL) && gazeY <= (r.bottom + TOL));
-    if(inside){ if(!tgt.classList.contains('highlight')) tgt.classList.add('highlight'); if(!fixationTimer){ fixationTimer = { startPerf: performance.now(), startWall: Date.now() }; } else { const dur = performance.now() - fixationTimer.startPerf; if(dur >= (parseInt(document.getElementById('fixDur').value,10)||350)){ const endWall = Date.now(); const fixationDur = Math.round(performance.now() - fixationTimer.startPerf); records.push({ trial: trials[currentIndex].id, duration_ms: fixationDur, start_ISO: new Date(fixationTimer.startWall).toISOString(), end_ISO: new Date(endWall).toISOString() }); fixationTimer = null; tgt.remove(); setTimeout(()=>{ currentIndex++; currentIndex < trials.length ? showNextTrial() : finishTest(); }, 500); } } }
-    else { fixationTimer = null; const t = arena.querySelector('.target'); if(t) t.classList.remove('highlight'); }
+    const inside = (gx >= (r.left - TOL) && gx <= (r.right + TOL) && gy >= (r.top - TOL) && gy <= (r.bottom + TOL));
+
+    if(inside){
+      if(!tgt.classList.contains('highlight')) tgt.classList.add('highlight');
+      if(fixationIndicator){ fixationIndicator.textContent = 'Fixation: Yes'; fixationIndicator.style.background = 'rgba(16,185,129,0.12)'; fixationIndicator.style.color = '#9ef6d7'; }
+      if(!fixationTimer){ fixationTimer = { startPerf: performance.now(), startWall: Date.now() }; }
+      else {
+        const dur = performance.now() - fixationTimer.startPerf;
+        if(dur >= (parseInt(fixDurInput?.value,10)||350)){
+          const endWall = Date.now();
+          const fixationDur = Math.round(performance.now() - fixationTimer.startPerf);
+          records.push({ trial: trials[currentIndex].id, duration_ms: fixationDur, start_ISO: new Date(fixationTimer.startWall).toISOString(), end_ISO: new Date(endWall).toISOString() });
+          fixationTimer = null; tgt.remove();
+          if(fixationIndicator){ fixationIndicator.textContent = 'Fixation: No'; fixationIndicator.style.background = 'rgba(255,255,255,0.04)'; fixationIndicator.style.color = '#ddd'; }
+          setTimeout(()=>{ currentIndex++; currentIndex < trials.length ? showNextTrial() : finishTest(); }, 500);
+        }
+      }
+    } else {
+      fixationTimer = null;
+      if(fixationIndicator){ fixationIndicator.textContent = 'Fixation: No'; fixationIndicator.style.background = 'rgba(255,255,255,0.04)'; fixationIndicator.style.color = '#ddd'; }
+      const t = arena.querySelector('.target'); if(t) t.classList.remove('highlight');
+    }
+
+    // update debug UI
+    try{
+      const raw = currentIris ? { x: Math.round((currentIris.x||0)*(videoRect?.width||window.innerWidth) + (videoRect?.left||0)), y: Math.round((currentIris.y||0)*(videoRect?.height||window.innerHeight) + (videoRect?.top||0)) } : null;
+      const sm = (isFinite(gazeX) && isFinite(gazeY)) ? { x: Math.round(gazeX), y: Math.round(gazeY) } : null;
+      if(dbgRawEl) dbgRawEl.textContent = raw ? `${raw.x},${raw.y}` : '-';
+      if(dbgSmEl) dbgSmEl.textContent = sm ? `${sm.x},${sm.y}` : '-';
+      if(dbgInsideEl) dbgInsideEl.textContent = inside ? 'YES' : 'no';
+    }catch(e){}
   }, 50);
 }
 
 function showNextTrial(){ const t = trials[currentIndex]; if(!t){ finishTest(); return; } showTarget(t); statusLine.textContent = `Trial ${currentIndex+1}/${trials.length}`; }
 
-function finishTest(){ running = false; clearInterval(gazeLoop); gazeLoop = null; playBtn.disabled = false; stopBtn.disabled = true; enableBtn.disabled = false; statusLine.textContent = `Test finished — ${records.length} fixations recorded`; arena.innerHTML=''; if(records.length){ const header = 'trial,start_ISO,end_ISO,duration_ms\n'; const rows = records.map(r=>`${r.trial},${r.start_ISO},${r.end_ISO},${r.duration_ms}`).join('\n'); const csv = header + rows; const blob = new Blob([csv], {type:'text/csv'}); const url = URL.createObjectURL(blob); const dl = document.createElement('a'); dl.href = url; dl.download = `fixations_${Date.now()}.csv`; dl.click(); dl.remove(); } }
+function finishTest(){
+  running = false;
+  clearInterval(gazeLoop);
+  gazeLoop = null;
+  playBtn.disabled = false;
+  stopBtn.disabled = true;
+  enableBtn.disabled = false;
+  statusLine.textContent = `Test finished — ${records.length} fixations recorded`;
+  arena.innerHTML='';
+  if(records.length){
+    const header = 'trial,start_ISO,end_ISO,duration_ms\n';
+    const rows = records.map(r=>`${r.trial},${r.start_ISO},${r.end_ISO},${r.duration_ms}`).join('\n');
+    const csv = header + rows;
+    const blob = new Blob([csv], {type:'text/csv'});
+    if(csvUrl) URL.revokeObjectURL(csvUrl);
+    csvUrl = URL.createObjectURL(blob);
+    if(downloadBtn){
+      downloadBtn.style.display = 'inline-block';
+      downloadBtn.onclick = ()=>{ const a = document.createElement('a'); a.href = csvUrl; a.download = `fixations_${Date.now()}.csv`; a.click(); a.remove(); };
+    }
+  }
+}
 
 playBtn.onclick = ()=> startTest();
 stopBtn.onclick = ()=> { if(running) finishTest(); };
 
-// small animation loop to keep gazeDot smooth when currentIris updates outside interval
-(function animate(){ try{ if(currentIris && mapping){ const mapped = mapping(currentIris); if(isFinite(mapped.x) && isFinite(mapped.y)){ if(!isFinite(gazeX)){ gazeX = mapped.x; gazeY = mapped.y; } gazeX += (mapped.x - gazeX) * gazeAlpha; gazeY += (mapped.y - gazeY) * gazeAlpha; gazeDot.style.left = Math.round(gazeX) + 'px'; gazeDot.style.top = Math.round(gazeY) + 'px'; gazeDot.style.display = 'block'; } } }catch(e){} requestAnimationFrame(animate); })();
+/* download button */
+if(downloadBtn){
+  downloadBtn.addEventListener('click', ()=>{
+    if(csvUrl){ const a = document.createElement('a'); a.href = csvUrl; a.download = `fixations_${Date.now()}.csv`; a.click(); a.remove(); }
+  });
+}
+
+/* smoothing UI */
+try{
+  if(gazeSmoothInput){
+    gazeSmoothInput.addEventListener('input', (e)=>{
+      const v = parseFloat(e.target.value);
+      if(!isNaN(v)){ gazeAlpha = v; if(gazeAlphaValueEl) gazeAlphaValueEl.textContent = v.toFixed(2); }
+    });
+  }
+}catch(e){}
+
+/* -----------------------
+   Single animation loop (stable)
+   ----------------------- */
+function animateGaze(){
+  try{
+    // ensure video rect is up-to-date
+    updateVideoRect();
+
+    if (currentIris){
+      // compute mapped coordinates (use mapping if calibrated; fallback to videoRect mapping)
+      let mapped = null;
+      if (mapping) {
+        mapped = mapping(currentIris);
+      } else if (videoRect) {
+        mapped = { x: videoRect.left + currentIris.x * videoRect.width, y: videoRect.top + currentIris.y * videoRect.height };
+      } else {
+        // last resort: window mapping (less accurate)
+        mapped = { x: currentIris.x * window.innerWidth, y: currentIris.y * window.innerHeight };
+      }
+
+      if (mapped && isFinite(mapped.x) && isFinite(mapped.y)){
+        if(!isFinite(gazeX)){ gazeX = mapped.x; gazeY = mapped.y; }
+        gazeX += (mapped.x - gazeX) * gazeAlpha;
+        gazeY += (mapped.y - gazeY) * gazeAlpha;
+
+        if (gazeDot && (showGazeDotCheckbox ? showGazeDotCheckbox.checked : true)){
+          try{ gazeDot.style.left = Math.round(gazeX) + 'px'; gazeDot.style.top = Math.round(gazeY) + 'px'; gazeDot.style.display = 'block'; }catch(e){}
+        }
+      } else {
+        // no valid mapped gaze — hide dot to avoid it sitting at 0,0
+        if (gazeDot) try{ gazeDot.style.display = 'none'; }catch(e){}
+      }
+    }
+  }catch(e){
+    console.error('animateGaze error', e);
+  }
+  requestAnimationFrame(animateGaze);
+}
+animateGaze();

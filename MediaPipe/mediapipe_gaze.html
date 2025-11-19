@@ -5,16 +5,47 @@
   <title>MediaPipe Gaze Test</title>
   <link rel="stylesheet" href="style.css">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    /* Target (trial) styling similar to WebGaze */
+    .target{
+      position:absolute;
+      width:90px;
+      height:90px;
+      background:#f97316;
+      border-radius:8px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      color:#032;
+      font-weight:700;
+      box-shadow:0 8px 20px rgba(0,0,0,0.45);
+      transition:transform .1s ease;
+    }
+    .target.highlight{ box-shadow:0 0 30px 6px rgba(34,197,94,0.28); background:#34d399; color:#022; transform:scale(1.03); }
+
+    /* calibration dot styling */
+    .cal-dot{
+      position:absolute;
+      width:56px;
+      height:56px;
+      border-radius:50%;
+      background:#60a5fa;
+      box-shadow:0 8px 20px rgba(0,0,0,0.6);
+      transition:transform .12s ease;
+    }
+  </style>
 </head>
 <body>
   <div style="max-width:1100px;margin:18px auto;color:white;font-family:Arial">
     <header style="display:flex;align-items:center;gap:12px">
-      <h1 style="margin:0;font-size:1.2rem">MediaPipe Gaze — Test</h1>
+      <h1 style="margin:0;font-size:1.2rem">MediaPipe Gaze — Test (MediaPipe)</h1>
       <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
         <button id="enableBtn">Enable Camera</button>
         <button id="calibrateBtn" disabled>Calibrate</button>
         <button id="playBtn">Start Test</button>
         <button id="stopBtn" disabled style="background:#ef4444">Stop</button>
+        <button id="downloadBtn" style="display:none;background:#10b981">Download CSV</button>
+        <label style="display:flex;align-items:center;gap:6px;color:#ddd;font-size:0.9rem"><input id="showGazeDot" type="checkbox" checked> Show gaze dot</label>
       </div>
     </header>
 
@@ -22,18 +53,40 @@
 
     <div id="arena" style="position:relative;margin-top:18px;height:70vh;border-radius:10px;background:rgba(255,255,255,0.02);overflow:hidden;border:1px solid rgba(255,255,255,0.03)"></div>
     <div id="statusLine" style="margin-top:8px">Status: idle</div>
+
+    <div id="videoPreview" style="position:fixed;left:12px;top:12px;width:180px;height:180px;border-radius:10px;overflow:hidden;background:#000;box-shadow:0 6px 20px rgba(0,0,0,0.6);z-index:100;">
+      <video id="vgVideo" autoplay muted playsinline style="width:100%;height:100%;object-fit:cover;transform:scaleX(-1);"></video>
+    </div>
+
+    <div id="fixationIndicator" aria-live="polite" style="margin-top:12px;padding:6px 8px;border-radius:8px;background:rgba(255,255,255,0.04);color:#ddd;font-weight:600;font-size:0.9rem;display:inline-block">Fixation: No</div>
+
+    <div id="debugPanel" style="margin-top:12px;margin-left:12px;padding:8px;border-radius:8px;background:rgba(0,0,0,0.45);color:#ddd;max-width:360px">
+      <div style="font-weight:700;margin-bottom:6px">Debug</div>
+      <div>Raw: <span id="dbgRaw">-</span></div>
+      <div>Smoothed: <span id="dbgSm">-</span></div>
+      <div>Conf: <span id="dbgConf">-</span></div>
+      <div>Inside: <span id="dbgInside">-</span></div>
+      <div style="margin-top:6px">Source: <select id="dbgSource"><option value="smoothed">Smoothed</option><option value="raw">Raw</option></select>
+        &nbsp; Conf Thresh: <input id="dbgConfThresh" type="number" step="0.01" min="0" max="1" value="0.05" style="width:64px"></div>
+    </div>
+
+    <div id="gazeSmoothingCtrl" style="position:fixed;top:12px;right:12px;background:rgba(0,0,0,0.45);color:#fff;padding:6px 8px;border-radius:6px;font-size:13px;z-index:100000">
+      <label style="margin-right:8px">Gaze smoothness</label>
+      <input id="gazeSmooth" type="range" min="0.02" max="0.5" step="0.01" value="0.18" style="vertical-align:middle;width:140px">
+      <span id="gazeAlphaValue" style="margin-left:8px;min-width:40px;display:inline-block">0.18</span>
+    </div>
   </div>
 
   <!-- hidden video/canvas for face-mesh processing -->
   <div style="position:fixed;right:12px;top:12px;width:220px;height:140px;border-radius:8px;overflow:hidden;background:#000;z-index:100">
     <video id="inputVideo" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;transform:scaleX(-1);"></video>
     <canvas id="outputCanvas" width="640" height="480" 
-        style="position:fixed;right:12px;top:12px;width:220px;
-               height:140px;z-index:100;pointer-events:none"></canvas>
+      style="position:fixed;right:12px;top:12px;width:220px;
+           height:140px;z-index:100;pointer-events:none;display:block"></canvas>
 
   </div>
 
-  <div id="gazeDot" style="position:fixed;left:0;top:0;width:18px;height:18px;border-radius:50%;background:rgba(255,60,60,0.95);pointer-events:none;transform:translate(-50%,-50%);z-index:10001;display:none"></div>
+    <div id="gazeDot" style="position:fixed;left:0;top:0;width:24px;height:24px;border-radius:50%;background:rgba(255,60,60,0.95);box-shadow:0 0 18px rgba(255,60,60,0.6);pointer-events:none;transform:translate(-50%,-50%);z-index:10001;display:none"></div>
 
   <div id="calibrateOverlay" style="position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:10000;background:rgba(0,0,0,0.8)"></div>
 
