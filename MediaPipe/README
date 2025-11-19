@@ -1,0 +1,14 @@
+MediaPipe Face Mesh: 
+    Solid choice for detecting facial landmarks and irises. It's lightweight, browser-friendly, and accurate for single-face tracking. Good pick.
+
+Camera Utils + Drawing Utils: 
+    These are standard with MediaPipe, but in your case, you barely need the drawing utils since most of the drawing is custom on your canvas. You could probably skip it if you want less clutter.
+
+Custom calibration + affine mapping: 
+    Conceptually fine, but the implementation can get a bit buggy (which you noticed). The loop-based collection of iris points per dot and then computing affine is prone to missed samples if the user moves or lighting is off. That’s probably why your “it kept bugging.”
+
+Smoothing & fixation logic: 
+    Works, but it’s very basic; no filtering for blinks or outliers, which can cause jittery gaze dots. Using a Kalman filter or weighted smoothing could help.
+
+In short: 
+    the software choices are appropriate, but the implementation logic for calibration and fixation detection is fragile, which is why it felt buggy. The libraries themselves are not the problem — it’s mostly the glue code.
