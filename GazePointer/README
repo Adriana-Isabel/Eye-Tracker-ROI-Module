@@ -1,0 +1,31 @@
+GazePointer Project Overview
+
+Initially, the project aimed to build a fully functional GazePointer system: a software capable of tracking a user’s eye movements on the screen to detect fixations and map gaze positions accurately. The goal was to replicate typical eye-tracking hardware solutions, enabling features such as:
+
+Real-time gaze dot following the user’s eyes.
+
+Calibration routines across the screen.
+
+Recording of gaze data and fixation metrics to a CSV file.
+
+Adjustable parameters like fixation duration and smoothing.
+
+During development, it became clear that replicating the accuracy and responsiveness of hardware-based eye trackers was not feasible with just a standard webcam. Limitations included:
+
+Webcam-based face/eye detection is imprecise, resulting in gaze points that drift or jitter.
+
+Calibration methods relying on software alone cannot fully correct for head movement, distance to the screen, or individual eye physiology.
+
+Accurate fixation detection requires sub-degree precision that typical webcams cannot provide.
+
+Given these constraints, the project shifted focus to a GazePointer adaptation:
+
+Using MediaPipe Face Mesh, the software approximates gaze direction by detecting iris landmarks.
+
+A calibration routine was kept, but simplified to provide approximate screen positions rather than precise eye-tracking accuracy.
+
+The gaze dot and fixation detection were maintained for usability tests, but with the understanding that results are indicative rather than exact.
+
+The system allows users to experiment with gaze-based interactions, collect data, and visualize eye movement patterns, despite the lack of specialized hardware.
+
+This adaptation preserves the core experience of a gaze-tracking system while acknowledging the hardware limitations, making it a research and learning tool rather than a professional-grade eye tracker.

@@ -88,7 +88,16 @@
 
     <div id="gazeDot" style="position:fixed;left:0;top:0;width:24px;height:24px;border-radius:50%;background:rgba(255,60,60,0.95);box-shadow:0 0 18px rgba(255,60,60,0.6);pointer-events:none;transform:translate(-50%,-50%);z-index:10001;display:none"></div>
 
-  <div id="calibrateOverlay" style="position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:10000;background:rgba(0,0,0,0.8)"></div>
+    <div id="calibrateOverlay" 
+      style="position:fixed;
+              inset:0;
+              display:none;
+              flex-wrap:wrap;
+              align-items:center;
+              justify-content:center;
+              z-index:10000;
+              background:rgba(0,0,0,0.8)">
+      </div>
 
   <script type="module" src="mediapipe_gaze.js"></script>
 </body>

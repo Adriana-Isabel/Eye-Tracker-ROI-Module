@@ -38,6 +38,7 @@ let camera = null;
 let currentIris = null; // {x,y} normalized in FaceMesh image coords
 let mapping = null;     // function(norm)->page coords
 let videoRect = null;   // bounding rect of the preview video (used for calibration & fallback)
+let videoMirrored = false; // whether the preview video is visually flipped (scaleX(-1))
 let csvUrl = null;
 
 /* gaze state */
@@ -163,35 +164,49 @@ function updateVideoRect(){
   videoRect = (vgVideo && vgVideo.getBoundingClientRect && vgVideo.getBoundingClientRect().width > 0)
     ? vgVideo.getBoundingClientRect()
     : (video.getBoundingClientRect ? video.getBoundingClientRect() : {left:0,top:0,width:window.innerWidth,height:window.innerHeight});
+  // detect if the preview video is visually mirrored (CSS transform scaleX(-1))
+  try{
+    const cs = vgVideo ? window.getComputedStyle(vgVideo) : null;
+    const t = cs ? (cs.transform || cs.getPropertyValue('transform') || '') : '';
+    // common forms: 'none', 'matrix(-1, 0, 0, 1, 0, 0)' or 'scaleX(-1)'
+    videoMirrored = !!(t && (t.indexOf('-1') !== -1 || t.indexOf('scaleX(-1)') !== -1));
+  }catch(e){ videoMirrored = false; }
 }
 
 function createCalDots(){
   updateVideoRect();
   calibrateOverlay.innerHTML = '';
-  calibrateOverlay.style.display = 'flex';
-  calibrateOverlay.style.alignItems = 'flex-start';
+  calibrateOverlay.style.display = 'block';  // show overlay
+  calibrateOverlay.style.background = 'rgba(0,0,0,0.8)';
+
+  // overlay is fixed, so dots inside are absolute relative to overlay
+  calibrateOverlay.style.position = 'fixed';
+  calibrateOverlay.style.inset = '0';
+  calibrateOverlay.style.pointerEvents = 'none';
+
   // 3x3 grid, positions relative to videoRect
   const positions = [
     [0.1,0.1],[0.5,0.1],[0.9,0.1],
     [0.1,0.5],[0.5,0.5],[0.9,0.5],
     [0.1,0.9],[0.5,0.9],[0.9,0.9]
   ];
+
   for(const [nx,ny] of positions){
     const d = document.createElement('div');
     d.className = 'cal-dot';
-    d.style.position = 'fixed';
-    const cx = Math.round(videoRect.left + nx * videoRect.width);
-    const cy = Math.round(videoRect.top  + ny * videoRect.height);
-    // place at center, then adjust after insert using actual element size
+    d.style.position = 'absolute';  // relative to overlay
+    const cx = nx * videoRect.width;
+    const cy = ny * videoRect.height;
     d.style.left = `${cx}px`;
     d.style.top = `${cy}px`;
     calibrateOverlay.appendChild(d);
-    // center by subtracting half width/height (reads computed size)
+    // center by subtracting half width/height
     const rect = d.getBoundingClientRect();
-    d.style.left = `${Math.round(cx - rect.width/2)}px`;
-    d.style.top = `${Math.round(cy - rect.height/2)}px`;
+    d.style.left = `${cx - rect.width/2}px`;
+    d.style.top  = `${cy - rect.height/2}px`;
   }
 }
+
 
 async function runCalibration(){
   if(!camera) { alert('Enable camera first'); return; }
@@ -227,7 +242,11 @@ async function runCalibration(){
           const use = filt.length >= 3 ? filt : collected;
           const avgX = use.reduce((s,v)=>s+v.nx,0)/use.length;
           const avgY = use.reduce((s,v)=>s+v.ny,0)/use.length;
-          samples.push({nx: avgX, ny: avgY, tx: centerX, ty: centerY});
+          // if preview is mirrored horizontally, invert the normalized x when computing page X
+          const nxForPage = videoMirrored ? (1 - avgX) : avgX;
+          const tx = Math.round(videoRect.left + nxForPage * videoRect.width);
+          const ty = Math.round(videoRect.top  + avgY * videoRect.height);
+          samples.push({nx: avgX, ny: avgY, tx: tx, ty: ty});
         }
       }finally{
         // always reset visual state for this dot
@@ -247,13 +266,33 @@ async function runCalibration(){
     statusLine.textContent='Status: calibration failed';
     return;
   }
-  mapping = computeAffine(samples);
-  if(!mapping){
+  // Try identity and flipped-x variants and pick best by RMSE
+  console.log('Calibration samples:', samples);
+  const tryVariants = [];
+  // variant A: identity (use samples as stored)
+  tryVariants.push({ name: 'identity', samples: samples });
+  // variant B: flip normalized x when fitting (treat nx' = 1 - nx)
+  tryVariants.push({ name: 'flipX', samples: samples.map(s => ({ nx: 1 - s.nx, ny: s.ny, tx: s.tx, ty: s.ty })) });
+
+  let best = null;
+  for(const v of tryVariants){
+    const m = computeAffine(v.samples);
+    if(!m) { console.warn('computeAffine returned null for variant', v.name); continue; }
+    // compute RMSE over samples
+    let se = 0, n=0;
+    for(const s of v.samples){ const p = m({ x: s.nx, y: s.ny }); if(p && isFinite(p.x) && isFinite(p.y)){ const dx = p.x - s.tx, dy = p.y - s.ty; se += dx*dx + dy*dy; n++; } }
+    const rmse = n>0 ? Math.sqrt(se/n) : Infinity;
+    console.log(`variant ${v.name} rmse=${rmse}`);
+    if(!best || rmse < best.rmse){ best = { name: v.name, mapping: m, rmse }; }
+  }
+  if(!best || !best.mapping){
     alert('Could not compute mapping');
     statusLine.textContent='Status: calibration failed';
     return;
   }
-  statusLine.textContent='Status: calibrated';
+  mapping = best.mapping;
+  console.log('Chosen mapping variant:', best.name, 'rmse=', best.rmse);
+  statusLine.textContent=`Status: calibrated (${best.name}, rmse ${Math.round(best.rmse)})`;
   calibrateBtn.disabled = false;
 }
 
@@ -416,7 +455,10 @@ function animateGaze(){
       if (mapping) {
         mapped = mapping(currentIris);
       } else if (videoRect) {
-        mapped = { x: videoRect.left + currentIris.x * videoRect.width, y: videoRect.top + currentIris.y * videoRect.height };
+        // account for mirrored preview when using direct videoRect fallback mapping
+        const nx = currentIris.x;
+        const nxForPage = videoMirrored ? (1 - nx) : nx;
+        mapped = { x: videoRect.left + nxForPage * videoRect.width, y: videoRect.top + currentIris.y * videoRect.height };
       } else {
         // last resort: window mapping (less accurate)
         mapped = { x: currentIris.x * window.innerWidth, y: currentIris.y * window.innerHeight };
