@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Beam-style FaceMesh Gaze Tracker</title>
+<style>
+:root{--bg:#0f1113;--panel:rgba(255,255,255,0.04);}
+html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family:Inter,system-ui,Segoe UI,Arial;}
+#controls{position:fixed;left:12px;top:12px;padding:12px;border-radius:10px;background:var(--panel);z-index:1000;max-width:calc(100% - 40px);}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px;}
+button{margin:0;padding:8px 12px;border-radius:6px;border:0;background:#2b2f33;color:#fff;cursor:pointer;}
+button:disabled{opacity:.45;cursor:not-allowed;}
+input[type="range"]{width:140px;}
+label.small{font-size:12px;color:#c7c7c7;}
+#video{position:fixed;right:10px;bottom:10px;width:240px;opacity:1;z-index:900;border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,.6);background:#000;}
+#cursorDot{position:fixed;left:50%;top:50%;width:18px;height:18px;border-radius:50%;background:#ff4d4d;pointer-events:none;transform:translate(-50%,-50%) scale(1);box-shadow:0 6px 14px rgba(0,0,0,0.5);z-index:999;transition:width .06s linear,height .06s linear;}
+#rawDot{position:fixed;left:50%;top:50%;width:10px;height:10px;border-radius:50%;background:#4ea3ff;pointer-events:none;transform:translate(-50%,-50%);box-shadow:0 6px 14px rgba(0,0,0,0.5);z-index:998;display:none;}
+.target{position:absolute;width:160px;height:120px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:white;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,.6);}
+#status{font-size:12px;color:#c7c7c7;margin-top:6px;}
+.calibDot{position:fixed;width:18px;height:18px;border-radius:50%;background:#fff;border:3px solid #1e88e5;transform:translate(-50%,-50%);z-index:1001;display:none;}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+</head>
+<body>
+
+<div id="controls">
+  <div class="row">
+    <button id="startBtn">Start Recording</button>
+    <button id="stopBtn" disabled>Stop Recording</button>
+    <button id="downloadBtn">Download CSV</button>
+    <button id="calBtn">Start 9-point Calibration</button>
+    <button id="clearCalBtn">Clear Calibration</button>
+  </div>
+  <div class="row">
+    <label class="small">Raw EMA α:</label>
+    <input id="sfSlider" type="range" min="0.02" max="0.6" step="0.01" value="0.18">
+    <label class="small" id="sfVal">0.18</label>
+    <label style="margin-left:12px" class="small">Display τ (ms):</label>
+    <input id="dsSlider" type="range" min="10" max="300" step="5" value="30">
+    <label class="small" id="dsVal">30</label>
+    <label style="margin-left:12px"><input id="showRawChk" type="checkbox"> Show raw pupil</label>
+  </div>
+  <div id="status" class="small">Status: <span id="statText">idle</span></div>
+</div>
+
+<div id="cursorDot"></div>
+<div id="rawDot"></div>
+<video id="video" autoplay playsinline muted></video>
+<div id="targetA" class="target">Left</div>
+<div id="targetB" class="target">Center</div>
+<div id="targetC" class="target">Right</div>
+<div id="calib" class="calibDot"></div>
+
+<script>
+/* ---------------- Constants ---------------- */
+const EMA_ALPHA = 0.18, VELOCITY_THRESHOLD=0.1, RADIUS_THRESHOLD=25;
+let SMOOTH_ALPHA=EMA_ALPHA, DISPLAY_TAU_MS=30;
+
+/* ---------------- Elements & State ---------------- */
+let video=document.getElementById('video');
+let cursorDot=document.getElementById('cursorDot');
+let rawDot=document.getElementById('rawDot');
+let camera=null, faceMesh=null;
+
+let isRecording=false, dataLog=[];
+let rawEye=null, emaEye=null, prevEye=null, prevTime=null;
+let velocity=0, visX=window.innerWidth/2, visY=window.innerHeight/2;
+let targetX=visX, targetY=visY, lastAnimTime=performance.now();
+let fixTimer=null, isFixating=false, fixationStart=null;
+let fixationCentroid=null, noFixStart=null, totalNoFixMs=0;
+
+let calibrationActive=false, calibPoints=[], calibSamplesPerPoint=30, currentCalibIndex=0;
+let polynomialCoeffsX=null, polynomialCoeffsY=null, hasCalibration=false;
+let calibData=[];
+
+const targets=[document.getElementById('targetA'),document.getElementById('targetB'),document.getElementById('targetC')];
+const startBtn=document.getElementById('startBtn');
+const stopBtn=document.getElementById('stopBtn');
+const downloadBtn=document.getElementById('downloadBtn');
+const calBtn=document.getElementById('calBtn');
+const clearCalBtn=document.getElementById('clearCalBtn');
+const statText=document.getElementById('statText');
+const statDetails=document.getElementById('statDetails');
+const showRawChk=document.getElementById('showRawChk');
+const sfSlider=document.getElementById('sfSlider');
+const sfVal=document.getElementById('sfVal');
+const dsSlider=document.getElementById('dsSlider');
+const dsVal=document.getElementById('dsVal');
+const calibEl=document.getElementById('calib');
+
+/* ---------------- Helpers ---------------- */
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function layoutTargets(){
+  const centerY=Math.round(window.innerHeight*0.4);
+  const centerX=window.innerWidth/2;
+  const spacing=Math.min(420,window.innerWidth*0.22);
+  targets[0].style.left=(centerX-spacing)+'px'; targets[0].style.top=centerY+'px';
+  targets[1].style.left=(centerX)+'px'; targets[1].style.top=centerY+'px';
+  targets[2].style.left=(centerX+spacing)+'px'; targets[2].style.top=centerY+'px';
+}
+window.addEventListener('resize',()=>{layoutTargets(); visX=clamp(visX,0,window.innerWidth); visY=clamp(visY,0,window.innerHeight);});
+layoutTargets();
+
+/* ---------------- MediaPipe Init ---------------- */
+async function initFaceMesh(){
+  faceMesh=new FaceMesh({locateFile:file=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});
+  faceMesh.setOptions({maxNumFaces:1,refineLandmarks:true,minDetectionConfidence:0.6,minTrackingConfidence:0.6});
+  faceMesh.onResults(onFaceResults);
+  camera=new Camera(video,{onFrame: async ()=>{await faceMesh.send({image:video});}, width:1280,height:720});
+  await camera.start();
+}
+
+/* ---------------- Eye Tracking ---------------- */
+function onFaceResults(results){
+  if(!results||!results.multiFaceLandmarks?.length) return;
+  const landmarks=results.multiFaceLandmarks[0];
+  const rightIdx=[469,470,471,472,473];
+  const leftIdx=[474,475,476,477,478];
+  const meanPoint=(indices)=>{
+    let sx=0,sy=0,n=0;
+    for(const i of indices){const lm=landmarks[i]; if(!lm)continue; sx+=lm.x; sy+=lm.y; n++;}
+    if(n===0) return null;
+    return {x:sx*video.videoWidth/n, y:sy*video.videoHeight/n};
+  };
+  const r=meanPoint(rightIdx), l=meanPoint(leftIdx);
+  if(!r||!l) return;
+  rawEye={x:(r.x+l.x)/2, y:(r.y+l.y)/2};
+  if(showRawChk.checked){
+    rawDot.style.display='block';
+    const vRect=video.getBoundingClientRect();
+    rawDot.style.left=vRect.left + (rawEye.x/video.videoWidth)*vRect.width +'px';
+    rawDot.style.top=vRect.top + (rawEye.y/video.videoHeight)*vRect.height +'px';
+  } else rawDot.style.display='none';
+  processEyeSample(performance.now());
+}
+
+function processEyeSample(ts){
+  if(!rawEye) return;
+  if(!emaEye){emaEye={...rawEye}; prevEye={...rawEye}; prevTime=ts; velocity=0;}
+  else{
+    emaEye.x += SMOOTH_ALPHA*(rawEye.x-emaEye.x);
+    emaEye.y += SMOOTH_ALPHA*(rawEye.y-emaEye.y);
+    const dt=Math.max(1,ts-prevTime);
+    velocity=Math.hypot(emaEye.x-prevEye.x, emaEye.y-prevEye.y)/dt;
+    prevEye={...emaEye}; prevTime=ts;
+  }
+  if(calibrationActive) collectCalibrationSample(emaEye);
+  if(hasCalibration && polynomialCoeffsX && polynomialCoeffsY){
+    const v=[1,emaEye.x,emaEye.y,emaEye.x**2,emaEye.y**2,emaEye.x*emaEye.y];
+    targetX = polynomialCoeffsX.reduce((s,c,i)=>s+c*v[i],0);
+    targetY = polynomialCoeffsY.reduce((s,c,i)=>s+c*v[i],0);
+  } else {
+    const vRect=video.getBoundingClientRect();
+    targetX=vRect.left+(emaEye.x/video.videoWidth)*vRect.width;
+    targetY=vRect.top+(emaEye.y/video.videoHeight)*vRect.height;
+  }
+  if(isRecording){
+    const tstamp=ts;
+    let noFixDur=0;
+    if(!isFixating && noFixStart) noFixDur=Math.round(tstamp-noFixStart);
+    dataLog.push({timestamp:tstamp,x:Math.round(targetX),y:Math.round(targetY),isFixating,fixationDuration:isFixating&&fixationStart?Math.round(tstamp-fixationStart):0,noFixationDuration:noFixDur,velocity});
+  }
+}
+
+/* ---------------- Animation ---------------- */
+function animate(){
+  const now=performance.now();
+  const dt=Math.max(0,now-lastAnimTime);
+  lastAnimTime=now;
+  const alpha=1-Math.exp(-dt/Math.max(1,DISPLAY_TAU_MS));
+  visX+=(targetX-visX)*alpha;
+  visY+=(targetY-visY)*alpha;
+  cursorDot.style.left=clamp(visX,0,window.innerWidth)+'px';
+  cursorDot.style.top=clamp(visY,0,window.innerHeight)+'px';
+  requestAnimationFrame(animate);
+}
+
+/* ---------------- Calibration ---------------- */
+function make9Points(){
+  const w=window.innerWidth, h=window.innerHeight, margin=0.12;
+  const xs=[margin,0.5,1-margin], ys=[margin,0.5,1-margin];
+  const pts=[];
+  for(const y of ys) for(const x of xs) pts.push({x:Math.round(x*w), y:Math.round(y*h)});
+  return pts;
+}
+function startCalibration(){
+  if(calibrationActive) return;
+  calibPoints=make9Points(); calibrationActive=true; currentCalibIndex=0;
+  polynomialCoeffsX=null; polynomialCoeffsY=null; hasCalibration=false;
+  calibData=Array(calibPoints.length).fill(0).map(()=>[]);
+  showCalibDotAt(calibPoints[0]);
+}
+function showCalibDotAt(pt){calibEl.style.display='block'; calibEl.style.left=pt.x+'px'; calibEl.style.top=pt.y+'px';}
+function hideCalibDot(){calibEl.style.display='none';}
+function collectCalibrationSample(eye){
+  if(!calibrationActive) return;
+  const idx=currentCalibIndex;
+  calibData[idx].push({ex:eye.x,ey:eye.y,tx:calibPoints[idx].x,ty:calibPoints[idx].y});
+  if(calibData[idx].length>=calibSamplesPerPoint){
+    currentCalibIndex++;
+    if(currentCalibIndex>=calibPoints.length){calibrationActive=false; hideCalibDot(); computeCalibration();}
+    else showCalibDotAt(calibPoints[currentCalibIndex]);
+  }
+}
+function computeCalibration(){
+  const samples=calibData.map(arr=>{
+    const meanEx=arr.reduce((s,p)=>s+p.ex,0)/arr.length;
+    const meanEy=arr.reduce((s,p)=>s+p.ey,0)/arr.length;
+    const meanTx=arr.reduce((s,p)=>s+p.tx,0)/arr.length;
+    const meanTy=arr.reduce((s,p)=>s+p.ty,0)/arr.length;
+    return {ex:meanEx,ey:meanEy,tx:meanTx,ty:meanTy};
+  });
+  if(samples.length<6){alert('Calibration failed — not enough samples'); return;}
+  const A=[], bx=[], by=[];
+  for(const s of samples){ const ex=s.ex, ey=s.ey; A.push([1,ex,ey,ex**2,ey**2,ex*ey]); bx.push(s.tx); by.push(s.ty); }
+  polynomialCoeffsX = solveLinear(multiply(transpose(A),A), multiplyVec(transpose(A),bx));
+  polynomialCoeffsY = solveLinear(multiply(transpose(A),A), multiplyVec(transpose(A),by));
+  hasCalibration=true; alert('Calibration complete!');
+}
+
+/* ---------------- Linear Algebra ---------------- */
+function transpose(M){return M[0].map((_,i)=>M.map(r=>r[i]));}
+function multiply(A,B){return A.map(r=>B[0].map((_,j)=>r.reduce((s,el,k)=>s+el*B[k][j],0))); }
+function multiplyVec(AT,b){return AT.map(r=>r.reduce((s,el,i)=>s+el*b[i],0));}
+function solveLinear(A,b){
+  // Gaussian elimination
+  const n=A.length; let M=A.map(r=>r.slice()), v=b.slice();
+  for(let k=0;k<n;k++){
+    let iMax=k; for(let i=k+1;i<n;i++) if(Math.abs(M[i][k])>Math.abs(M[iMax][k])) iMax=i;
+    [M[k],M[iMax]]=[M[iMax],M[k]]; [v[k],v[iMax]]=[v[iMax],v[k]];
+    for(let i=k+1;i<n;i++){
+      let f=M[i][k]/M[k][k]; for(let j=k;j<n;j++) M[i][j]-=f*M[k][j]; v[i]-=f*v[k];
+    }
+  }
+  const x=Array(n).fill(0);
+  for(let i=n-1;i>=0;i--){
+    let s=0; for(let j=i+1;j<n;j++) s+=M[i][j]*x[j];
+    x[i]=(v[i]-s)/M[i][i];
+  }
+  return x;
+}
+
+/* ---------------- CSV Download ---------------- */
+downloadBtn.addEventListener('click',()=>{
+  if(!dataLog.length) return;
+  const header=Object.keys(dataLog[0]).join(',');
+  const rows=dataLog.map(r=>Object.values(r).join(',')).join('\n');
+  const blob=new Blob([header+'\n'+rows],{type:'text/csv'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download='gaze_data.csv'; a.click();
+});
+
+/* ---------------- Buttons ---------------- */
+startBtn.addEventListener('click', async ()=>{
+  if(!camera) await initFaceMesh();
+  isRecording=true; dataLog=[]; totalNoFixMs=0; noFixStart=null;
+  statText.innerText='recording';
+  startBtn.disabled=true; stopBtn.disabled=false;
+  requestAnimationFrame(animate);
+});
+stopBtn.addEventListener('click', ()=>{
+  isRecording=false;
+  if(noFixStart) totalNoFixMs += (performance.now()-noFixStart);
+  noFixStart=null;
+  statText.innerText='idle';
+  startBtn.disabled=false; stopBtn.disabled=true;
+});
+calBtn.addEventListener('click', startCalibration);
+clearCalBtn.addEventListener('click', ()=>{polynomialCoeffsX=null; polynomialCoeffsY=null; hasCalibration=false; alert('Calibration cleared');});
+
+/* ---------------- Slider UI ---------------- */
+sfSlider.addEventListener('input',()=>{SMOOTH_ALPHA=parseFloat(sfSlider.value); sfVal.innerText=sfSlider.value;});
+dsSlider.addEventListener('input',()=>{DISPLAY_TAU_MS=parseInt(dsSlider.value); dsVal.innerText=dsSlider.value;});
+
+/* ---------------- Pupil Overlay ---------------- */
+const overlayCanvas=document.createElement('canvas');
+overlayCanvas.style.position='fixed'; overlayCanvas.style.left='0px'; overlayCanvas.style.top='0px';
+overlayCanvas.style.pointerEvents='none'; overlayCanvas.width=window.innerWidth; overlayCanvas.height=window.innerHeight;
+overlayCanvas.style.zIndex='950'; document.body.appendChild(overlayCanvas);
+const overlayCtx=overlayCanvas.getContext('2d');
+function drawPupilDots(ctx,landmarks){
+  if(!landmarks) return;
+  const rightIdx=[469,470,471,472,473], leftIdx=[474,475,476,477,478];
+  const videoW=video.videoWidth, videoH=video.videoHeight;
+  const mean=(indices)=>{let sx=0,sy=0,n=0; for(const i of indices){const lm=landmarks[i]; if(!lm) continue; sx+=lm.x; sy+=lm.y; n++;} if(n===0) return null; return {x:sx/n*videoW, y:sy/n*videoH};}
+  const r=mean(rightIdx), l=mean(leftIdx);
+  if(r && l){ const cx=(r.x+l.x)/2; const cy=(r.y+l.y)/2; ctx.beginPath(); ctx.arc(cx,cy,4,0,2*Math.PI); ctx.fillStyle='#ff0000'; ctx.fill(); }
+}
+function animateOverlay(){
+  overlayCtx.clearRect(0,0,overlayCanvas.width,overlayCanvas.height);
+  if(faceMesh && faceMesh.lastResults) drawPupilDots(overlayCtx, faceMesh.lastResults.multiFaceLandmarks?.[0]);
+  requestAnimationFrame(animateOverlay);
+}
+animateOverlay();
+window.addEventListener('resize',()=>{overlayCanvas.width=window.innerWidth; overlayCanvas.height=window.innerHeight;});
+
+</script>
+</body>
+</html>
