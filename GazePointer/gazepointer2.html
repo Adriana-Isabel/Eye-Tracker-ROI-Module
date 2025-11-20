@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Gaze Tracker + Fixation + Calibration</title>
+<style>
+:root{--bg:#0b0b0d;--panel:rgba(0,0,0,0.45);--btn:#3b3b3b;--accent:#ef4444;}
+html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family:sans-serif;}
+#controls{position:fixed;left:12px;top:12px;z-index:60;background:var(--panel);padding:10px;border-radius:8px;display:flex;gap:8px;align-items:center;}
+button{background:var(--btn);color:#fff;border:0;padding:8px 12px;border-radius:6px;cursor:pointer;font-size:14px;}
+button:disabled{opacity:0.45;cursor:default;}
+#video{position:fixed;right:12px;bottom:12px;width:260px;opacity:0.15;border-radius:8px;z-index:30;}
+#canvasOverlay{position:fixed;right:12px;bottom:12px;width:260px;height:auto;z-index:31;pointer-events:none;border-radius:8px;}
+#cursorDot{position:absolute;width:18px;height:18px;border-radius:50%;transform:translate(-50%,-50%);pointer-events:none;z-index:80;background:var(--accent);box-shadow:0 0 12px rgba(239,68,68,0.6);transition:left 0.06s linear, top 0.06s linear;}
+.target{position:absolute;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;user-select:none;box-shadow:0 6px 18px rgba(0,0,0,0.6);}
+#square1{left:180px;top:160px;width:140px;height:140px;background:#1677ff;}
+#square2{left:380px;top:160px;width:140px;height:140px;background:#10b981;}
+#square3{left:580px;top:160px;width:140px;height:140px;background:#f59e0b;}
+#calibrationOverlay{position:fixed;top:0;left:0;width:100%;height:100%;z-index:100;background:rgba(0,0,0,0.4);display:flex;align-items:center;justify-content:center;flex-wrap:wrap;}
+.calDot{width:36px;height:36px;border-radius:50%;background:#fff;margin:28px;opacity:0.6;display:flex;align-items:center;justify-content:center;font-size:12px;color:#111;font-weight:700;transition:opacity 0.18s;}
+.calDot.active{opacity:1;background:#ef4444;color:#fff;}
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+<script src="https://webgazer.cs.brown.edu/webgazer.js"></script>
+</head>
+<body>
+
+<div id="controls">
+<button id="startBtn">Start Recording</button>
+<button id="stopBtn">Stop Recording</button>
+<button id="calibrateBtn">Calibrate</button>
+<button id="downloadBtn">Download CSV</button>
+<div id="status">idle</div>
+</div>
+
+<video id="video" autoplay playsinline muted></video>
+<canvas id="canvasOverlay"></canvas>
+<div id="cursorDot"></div>
+
+<div id="square1" class="target">A</div>
+<div id="square2" class="target">B</div>
+<div id="square3" class="target">C</div>
+
+<div id="calibrationOverlay" style="display:none;"></div>
+
+<script>
+let isRecording=false,dataLog=[],fixationX=null,fixationY=null,fixTimer=null,isFixating=false,fixationStartTime=null,totalNoFixationTime=0,noFixationStart=null;
+let smoothX=null,smoothY=null,s2x=null,s2y=null,prevX=null,prevY=null,prevTime=null,velocity=0;
+let lastIris=null,affineMatrix=null;
+
+const cursorDot=document.getElementById('cursorDot'),statusEl=document.getElementById('status');
+const gazeTargets=[{id:'square1',element:document.getElementById('square1')},{id:'square2',element:document.getElementById('square2')},{id:'square3',element:document.getElementById('square3')}];
+
+async function initCamera(){const v=document.getElementById('video');const s=await navigator.mediaDevices.getUserMedia({video:{width:640,height:360,frameRate:{ideal:30,max:30}},audio:false});v.srcObject=s;await v.play();}
+
+const faceMesh=new FaceMesh({locateFile:(file)=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`});
+faceMesh.setOptions({maxNumFaces:1,refineLandmarks:true,minDetectionConfidence:0.5,minTrackingConfidence:0.5});
+const mpVideo=document.getElementById('video'),canvasOverlay=document.getElementById('canvasOverlay'),mpCtx=canvasOverlay.getContext('2d');
+
+faceMesh.onResults(results=>{
+  if(!results.multiFaceLandmarks) return;
+  mpCtx.clearRect(0,0,canvasOverlay.width,canvasOverlay.height);
+  canvasOverlay.width=260; canvasOverlay.height=mpVideo.videoHeight*(260/mpVideo.videoWidth);
+  const lm=results.multiFaceLandmarks[0];
+  if(lm && lm[468] && lm[473]){
+    const li=lm[468],ri=lm[473];
+    const cx=(li.x+ri.x)/2*canvasOverlay.width,cy=(li.y+ri.y)/2*canvasOverlay.height;
+    lastIris={x:mpVideo.getBoundingClientRect().left+cx,y:mpVideo.getBoundingClientRect().top+cy,t:performance.now()};
+  }
+});
+
+function startFaceMeshLoop(){let lastFrame=0; async function loop(){const now=performance.now();if(now-lastFrame>66){if(mpVideo.readyState>=2){try{await faceMesh.send({image:mpVideo});}catch(e){}}lastFrame=now;}requestAnimationFrame(loop);} loop();}
+
+function startWebGazer(){
+  webgazer.setRegression('ridge').showVideoPreview(false).showPredictionPoints(false).applyKalmanFilter(true);
+  webgazer.setGazeListener((data)=>{
+    if(!data) return;
+    const now=performance.now();
+    smoothX = smoothX===null?data.x:smoothX+0.12*(data.x-smoothX);
+    smoothY = smoothY===null?data.y:smoothY+0.12*(data.y-smoothY);
+    s2x = s2x===null?smoothX:s2x+0.15*(smoothX-s2x);
+    s2y = s2y===null?smoothY:s2y+0.15*(smoothY-s2y);
+    let mappedX=s2x,mappedY=s2y;
+    if(affineMatrix){const m=affineMatrix; mappedX=m.a*mappedX+m.b*mappedY+m.tx; mappedY=m.c*mappedX+m.d*mappedY+m.ty;}
+    const x=mappedX,y=mappedY;
+    cursorDot.style.left=x+'px'; cursorDot.style.top=y+'px';
+
+    if(prevX!==null){const dt=Math.max(1,now-prevTime),dx=x-prevX,dy=y-prevY;velocity=Math.sqrt(dx*dx+dy*dy)/dt;}else velocity=0;
+    prevX=x; prevY=y; prevTime=now;
+
+    const spatialStable=fixationX!==null&&fixationY!==null?Math.hypot(x-fixationX,y-fixationY)<55:true;
+    const velocityStable=velocity<0.55;
+
+    if(spatialStable&&velocityStable){
+      if(!fixTimer) fixTimer=now;
+      if(!isFixating && now-fixTimer>=300){isFixating=true;fixationStartTime=now;fixationX=x;fixationY=y;}
+      else if(isFixating){const a=0.1; fixationX+=a*(x-fixationX); fixationY+=a*(y-fixationY);}
+    }else{isFixating=false;fixationStartTime=null;fixTimer=null;fixationX=x;fixationY=y;}
+
+    if(!isFixating){if(!noFixationStart) noFixationStart=now;}else{if(noFixationStart){totalNoFixationTime+=now-noFixationStart;noFixationStart=null;}}
+
+    let lookedAt="none";
+    for(const t of gazeTargets){const r=t.element.getBoundingClientRect();if(x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom){lookedAt=t.id;break;}}
+
+    const fixationDuration=isFixating&&fixationStartTime?Math.round(now-fixationStartTime):0;
+    if(isRecording)dataLog.push({timestamp:Math.round(now),x:Math.round(x),y:Math.round(y),isFixating,fixationDuration,fixationCentroidX:Math.round(fixationX),fixationCentroidY:Math.round(fixationY),velocity:Number(velocity.toFixed(4)),lookedAt});
+    statusEl.textContent=isRecording?(isFixating?`Fixating (${lookedAt})`:`Scanning (${lookedAt})`):'idle';
+  }).begin();
+}
+
+function downloadCSV(){
+  if(isRecording) console.warn('Stop recording first');
+  let csv='timestamp_ms,x_px,y_px,isFixating,fixationDuration_ms,fixationCentroidX,fixationCentroidY,velocity_px_per_ms,lookedAt\n';
+  for(const r of dataLog) csv+=`${r.timestamp},${r.x},${r.y},${r.isFixating},${r.fixationDuration},${r.fixationCentroidX},${r.fixationCentroidY},${r.velocity},${r.lookedAt}\n`;
+  csv+=`\nTotal_No_Fixation_Time_ms,${Math.round(totalNoFixationTime)}\n`;
+  const blob=new Blob([csv],{type:'text/csv'}),url=URL.createObjectURL(blob),a=document.createElement('a');
+  a.href=url;a.download=`gaze_data_${Date.now()}.csv`;a.click();URL.revokeObjectURL(url);
+}
+
+/* ---------- Buttons ---------- */
+document.getElementById('startBtn').onclick=()=>{
+  isRecording=true;dataLog=[];totalNoFixationTime=0;noFixationStart=null;
+  smoothX=smoothY=s2x=s2y=prevX=prevY=prevTime=null;
+  velocity=0;fixTimer=null;isFixating=false;fixationStartTime=null;fixationX=fixationY=null;
+  statusEl.textContent='recording...';updateButtons();
+};
+document.getElementById('stopBtn').onclick=()=>{
+  isRecording=false;if(noFixationStart){totalNoFixationTime+=performance.now()-noFixationStart;noFixationStart=null;}statusEl.textContent='stopped';updateButtons();
+};
+document.getElementById('downloadBtn').onclick=downloadCSV;
+function updateButtons(){document.getElementById('startBtn').disabled=!!isRecording;document.getElementById('stopBtn').disabled=!isRecording;}
+
+/* ---------- Boot ---------- */
+(async function boot(){await initCamera(); startFaceMeshLoop(); setTimeout(startWebGazer,500); updateButtons();})();
+</script>
+</body>
+</html>

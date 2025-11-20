@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Gazepoint-style (Webcam) — Fixation & Object Logging</title>
+<style>
+  :root { --bg: #0f1113; --panel: rgba(255,255,255,0.04); --muted: #cfd8dc; }
+  html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family:Inter,system-ui,Segoe UI,Arial;}
+  #controls{position:fixed;left:12px;top:12px;padding:10px;border-radius:8px;background:var(--panel);z-index:1000}
+  button{margin:4px;padding:8px 12px;border-radius:6px;border:0;background:#2b2f33;color:#fff;cursor:pointer}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  #video{position:fixed;right:10px;bottom:10px;width:200px;opacity:0.28;z-index:1000;border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,.6)}
+  #cursorDot{
+    position:fixed;left:50%;top:50%;width:18px;height:18px;border-radius:50%;
+    background:#ff4d4d;pointer-events:none;transform:translate(-50%,-50%) scale(1);
+    box-shadow:0 6px 14px rgba(0,0,0,0.5);z-index:999;
+    transition:width .08s linear,height .08s linear,transform .08s linear;
+  }
+  /* Example targets */
+  .target{position:absolute;width:160px;height:120px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:white;font-weight:600;box-shadow:0 8px 24px rgba(0,0,0,.6)}
+  #targetA{left:120px;top:140px;background:#1e88e5}
+  #targetB{left:420px;top:200px;background:#43a047}
+  #targetC{left:760px;top:120px;background:#f4511e}
+  /* dwell progress overlay inside buttons */
+  .dwell-progress{position:absolute;inset:0;border-radius:6px;pointer-events:none;display:none}
+  /* small status */
+  #status{font-size:12px;color:#c7c7c7;margin-top:6px}
+  .small{font-size:12px;color:#bcd}
+</style>
+<!-- WebGazer (webgazer.js) -->
+<script src="https://webgazer.cs.brown.edu/webgazer.js"></script>
+</head>
+<body>
+
+<div id="controls">
+  <div style="display:flex;align-items:center;">
+    <button id="startBtn">Start Recording<div class="dwell-progress"></div></button>
+    <button id="stopBtn" disabled>Stop Recording<div class="dwell-progress"></div></button>
+    <button id="downloadBtn">Download CSV<div class="dwell-progress"></div></button>
+  </div>
+  <div id="status" class="small">Status: <span id="statText">idle</span></div>
+  <div class="small" id="statDetails"></div>
+</div>
+
+<div id="cursorDot"></div>
+<video id="video" autoplay playsinline muted></video>
+
+<!-- Example targets you can look at -->
+<div id="targetA" class="target">Blue Box</div>
+<div id="targetB" class="target">Green Box</div>
+<div id="targetC" class="target">Orange Box</div>
+
+<script>
+/* ===========================
+   Config & runtime variables
+   =========================== */
+const SMOOTH_FACTOR = 0.22;   // lower -> smoother (but slower)
+const DISPLAY_INTERP = 0.22;  // visual dot interpolation
+const VELOCITY_THRESHOLD = 0.36; // px/ms (tweak if needed)
+const RADIUS_THRESHOLD = 45;  // px spatial radius
+const MIN_FIX_TIME = 300;     // ms for fixation
+const DWELL_TIME = 800;       // ms for button dwell activation
+
+let isRecording = false;
+let dataLog = [];
+
+let smoothX = null, smoothY = null;
+let prevX = null, prevY = null, prevTime = null;
+let velocity = 0;
+
+let fixTimer = null;
+let isFixating = false;
+let fixationStartTime = null;
+let fixationX = null, fixationY = null;
+
+let totalNoFixationTime = 0;
+let noFixationStart = null;
+
+// visual dot positions (for interpolation)
+let visX = window.innerWidth/2, visY = window.innerHeight/2;
+let targetVisX = visX, targetVisY = visY;
+
+// gazeable objects (populated after DOM ready)
+let gazeTargets = [];
+
+/* ===========================
+   Helpers
+   =========================== */
+function distance(a,b){ return Math.hypot(a.x-b.x,a.y-b.y); }
+function nowMs(){ return performance.now(); }
+
+/* ===========================
+   Camera init (for preview)
+   =========================== */
+async function initCameraPreview(){
+  try{
+    const v = document.getElementById('video');
+    const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    v.srcObject = s;
+  }catch(e){
+    console.warn('camera preview failed',e);
+  }
+}
+
+/* ===========================
+   Gaze-targets registration
+   =========================== */
+function initGazeTargets(){
+  // Put any element you want to be tracked in this array with an id property
+  gazeTargets = [
+    { id: 'targetA', element: document.getElementById('targetA') },
+    { id: 'targetB', element: document.getElementById('targetB') },
+    { id: 'targetC', element: document.getElementById('targetC') }
+  ];
+}
+
+/* ===========================
+   WebGazer listener
+   =========================== */
+function startWebGazer(){
+  // configure webgazer to reduce visible clutter and enable its internal Kalman filter
+  webgazer
+    .showVideoPreview(false)
+    .showPredictionPoints(false)
+    .applyKalmanFilter(true);
+
+  webgazer.setGazeListener((data, timestamp) => {
+    if(!data) return;
+    const tstamp = (typeof timestamp === 'number' && isFinite(timestamp)) ? timestamp : nowMs();
+
+    // ---- smoothing of raw gaze ----
+    if(smoothX === null){
+      smoothX = data.x;
+      smoothY = data.y;
+    } else {
+      smoothX = smoothX + SMOOTH_FACTOR * (data.x - smoothX);
+      smoothY = smoothY + SMOOTH_FACTOR * (data.y - smoothY);
+    }
+
+    const x = smoothX;
+    const y = smoothY;
+
+    // ---- compute velocity (px / ms) ----
+    if(prevX !== null && prevY !== null && prevTime !== null){
+      const dt = Math.max(1, tstamp - prevTime);
+      const dx = x - prevX;
+      const dy = y - prevY;
+      velocity = Math.sqrt(dx*dx + dy*dy) / dt; // px per ms
+    } else {
+      velocity = 0;
+    }
+    prevX = x; prevY = y; prevTime = tstamp;
+
+    // ---- Gazepoint-style fixation detection ----
+    let spatialStable = true;
+    if(fixationX !== null){
+      const dist = Math.hypot(x - fixationX, y - fixationY);
+      spatialStable = dist < RADIUS_THRESHOLD;
+    }
+
+    const velocityStable = velocity < VELOCITY_THRESHOLD;
+
+    if(spatialStable && velocityStable){
+      if(!fixTimer) fixTimer = tstamp;
+      if(!isFixating && (tstamp - fixTimer) >= MIN_FIX_TIME){
+        // fixation ON
+        isFixating = true;
+        fixationStartTime = tstamp;
+        // compute centroid as current point (we could average multiple points if needed)
+        fixationX = x;
+        fixationY = y;
+        // close out no-fixation accumulation
+        if(noFixationStart){
+          totalNoFixationTime += (tstamp - noFixationStart);
+          noFixationStart = null;
+        }
+      } else if(isFixating){
+        // while fixating, optionally update centroid with slow average to accomodate tiny drift
+        fixationX = fixationX + 0.06 * (x - fixationX);
+        fixationY = fixationY + 0.06 * (y - fixationY);
+      }
+    } else {
+      // break fixation
+      if(isFixating){
+        // we just left a fixation
+        isFixating = false;
+        fixTimer = null;
+        fixationStartTime = null;
+      } else {
+        fixTimer = null;
+      }
+      // start no-fixation timer if recording
+      if(isRecording && !noFixationStart) noFixationStart = tstamp;
+      // reset centroid gradually toward current
+      fixationX = x;
+      fixationY = y;
+    }
+
+    // ---- object detection: which target is under gaze ----
+    let lookedAt = 'none';
+    for(const obj of gazeTargets){
+      const r = obj.element.getBoundingClientRect();
+      if(x >= r.left && x <= r.right && y >= r.top && y <= r.bottom){
+        lookedAt = obj.id;
+        break;
+      }
+    }
+
+    // ---- log (when recording) ----
+    if(isRecording){
+      dataLog.push({
+        timestamp: tstamp,
+        x: x, y: y,
+        isFixating: !!isFixating,
+        fixationDuration: isFixating && fixationStartTime ? Math.round(tstamp - fixationStartTime) : 0,
+        fixationX: fixationX !== null ? Math.round(fixationX) : '',
+        fixationY: fixationY !== null ? Math.round(fixationY) : '',
+        velocity: velocity,
+        lookedAt: lookedAt
+      });
+    }
+
+    // ---- update visual dot target (for smooth visual) ----
+    targetVisX = x; targetVisY = y;
+
+    // ---- update status UI ----
+    updateStatusUI({isFixating, velocity, lookedAt});
+  }).begin();
+}
+
+/* ===========================
+   Visual dot animation (requestAnimationFrame)
+   =========================== */
+const cursorDot = document.getElementById('cursorDot');
+function animateDot(){
+  // interpolate visX, visY toward targetVisX/Y
+  visX += (targetVisX - visX) * DISPLAY_INTERP;
+  visY += (targetVisY - visY) * DISPLAY_INTERP;
+
+  // apply to element while clamping into the viewport
+  const clampedX = Math.max(0, Math.min(window.innerWidth, visX));
+  const clampedY = Math.max(0, Math.min(window.innerHeight, visY));
+  cursorDot.style.left = clampedX + 'px';
+  cursorDot.style.top = clampedY + 'px';
+
+  // subtle scaling when fixating
+  if(isFixating){
+    cursorDot.style.transform = 'translate(-50%,-50%) scale(0.9)';
+    cursorDot.style.width = '16px'; cursorDot.style.height = '16px';
+  } else {
+    cursorDot.style.transform = 'translate(-50%,-50%) scale(1)';
+    cursorDot.style.width = '18px'; cursorDot.style.height = '18px';
+  }
+
+  requestAnimationFrame(animateDot);
+}
+
+/* ===========================
+   CSV download
+   =========================== */
+function downloadCSV(){
+  // finalize no-fixation if currently running
+  if(noFixationStart){
+    totalNoFixationTime += (nowMs() - noFixationStart);
+    noFixationStart = null;
+  }
+
+  let csv = 'timestamp,x,y,isFixating,fixationDuration,fixationX,fixationY,velocity,lookedAt\n';
+  for(const r of dataLog){
+    csv += `${r.timestamp},${r.x},${r.y},${r.isFixating},${r.fixationDuration},${r.fixationX},${r.fixationY},${r.velocity},${r.lookedAt}\n`;
+  }
+  csv += `\nTotal_No_Fixation_Time_ms,${Math.round(totalNoFixationTime)}\n`;
+  const blob = new Blob([csv], {type:'text/csv'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `gaze_log_${Date.now()}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/* ===========================
+   UI & controls
+   =========================== */
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const statText = document.getElementById('statText');
+const statDetails = document.getElementById('statDetails');
+
+startBtn.onclick = () => {
+  isRecording = true;
+  dataLog = [];
+  totalNoFixationTime = 0;
+  noFixationStart = null;
+  statText.innerText = 'recording';
+  updateButtons();
+};
+
+stopBtn.onclick = () => {
+  isRecording = false;
+  // finalize no-fixation
+  if(noFixationStart){
+    totalNoFixationTime += (nowMs() - noFixationStart);
+    noFixationStart = null;
+  }
+  statText.innerText = 'idle';
+  updateButtons();
+};
+
+downloadBtn.onclick = downloadCSV;
+
+function updateButtons(){
+  startBtn.disabled = isRecording;
+  stopBtn.disabled = !isRecording;
+}
+
+/* update small status elements */
+function updateStatusUI({isFixating, velocity, lookedAt}){
+  statText.innerText = isRecording ? (isFixating ? 'fixating' : 'scanning') : 'idle';
+  statDetails.innerText = `vel: ${velocity.toFixed(3)} px/ms · fix:${isFixating ? 'YES' : 'NO'} · target: ${lookedAt}`;
+}
+
+/* ===========================
+   Init everything on load
+   =========================== */
+window.addEventListener('load', () => {
+  initCameraPreview();
+  initGazeTargets();
+  startWebGazer();
+  animateDot();
+  updateButtons();
+});
+
+/* ===========================
+   Optional: tidy up on page hide
+   =========================== */
+window.addEventListener('beforeunload', () => {
+  try{ webgazer.end(); }catch(e){}
+});
+</script>
+
+</body>
+</html>
