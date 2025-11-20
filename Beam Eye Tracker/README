@@ -1,0 +1,32 @@
+Overview: Beam Eye Tracker & VSCode Adaptation
+
+Beam Eye Tracker
+    A dedicated eye-tracking device that accurately tracks a user’s gaze on a screen.
+    Provides real-time gaze coordinates, fixations, and saccades through its proprietary software.
+
+Typically includes:
+    On-screen gaze overlay (a dot or ring showing where the user is looking)
+    Calibration routines for each user
+    Data export options (raw gaze, fixations, events)
+
+Challenges with VSCode Integration
+    The Beam device itself doesn’t directly connect to VSCode.
+    Node.js/WebSocket scripts will fail (ECONNREFUSED) unless the Beam software exposes a developer API or WebSocket server.
+    Many users cannot access a “developer mode,” so direct programmatic access is often blocked.
+
+Workaround / Adaptation
+    Use webcam-based gaze tracking libraries in VSCode:
+    Examples: MediaPipe Face Mesh, WebGazer.js, OpenCV-based eye tracking
+    Can track gaze, estimate fixations, and log events to CSV
+    Runs entirely in Node.js, Python, or web environments without Beam hardware
+
+Build a custom Beam-like experiment emulator:
+    Calibration points on screen
+    Real-time gaze dot (optional)
+    Fixation detection (gaze stays in a region for a minimum duration)
+    Data recording and CSV export   
+    Accuracy is lower than Beam but fully controllable within VSCode
+
+Conclusion
+    Direct connection between Beam Eye Tracker and VSCode for real-time data is only possible with a developer API.
+    Without that, you can emulate the Beam workflow using a standard webcam and software libraries, achieving similar experiments, fixation logging, and analysis within your development environment.
